@@ -53,7 +53,7 @@ class Kraken:
         self.get("/0/public/Time")
 
     def _nonce(self) -> str:
-        current = int(time.time() * 1000)
+        current = int(time.time_ns() // 1000)
         if current <= self._last_nonce:
             current = self._last_nonce + 1
         self._last_nonce = current

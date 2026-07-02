@@ -681,7 +681,7 @@ def _read_service_env_symbol(env_path: Path) -> str | None:
             k = k.strip().upper()
             v = v.strip()
             if k == "SYMBOL":
-                symbol = v.upper()
+                symbol = v.upper().replace("/", "").replace("-", "").replace("_", "")
                 break
         if symbol:
             return symbol
