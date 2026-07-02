@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import time
 from urllib.parse import urlencode
 
@@ -48,12 +49,13 @@ class Kraken:
         self.session = requests.Session()
         self.symbol_mapper = SymbolMapper(self, quoteAsset)
         self._last_nonce = 0
+        self.nonceOffset = int(os.getenv("KRAKEN_NONCE_OFFSET", "0") or "0")
 
     def syncTime(self) -> None:
         self.get("/0/public/Time")
 
     def _nonce(self) -> str:
-        current = int(time.time_ns())
+        current = int(time.time_ns()) + self.nonceOffset
         if current <= self._last_nonce:
             current = self._last_nonce + 1
         self._last_nonce = current
