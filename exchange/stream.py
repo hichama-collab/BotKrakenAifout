@@ -110,6 +110,30 @@ class Stream:
     def stop(self):
         self._stop.set()
 
+    def _rest_fallback(self) -> tuple[float, float, float, int]:
+        if not bool(getattr(self.cfg, "dryRun", False)):
+            return 0.0, 0.0, 0.0, 0
+        client = getattr(self.mapper, "client", None)
+        if client is None or not hasattr(client, "best_bid_ask"):
+            return 0.0, 0.0, 0.0, 0
+        try:
+            bid, ask = client.best_bid_ask(self.symbol)
+            bid = float(bid)
+            ask = float(ask)
+        except Exception as exc:
+            print("WS_REST_FALLBACK_FAIL", type(exc).__name__, str(exc))
+            return 0.0, 0.0, 0.0, 0
+        if bid <= 0 or ask <= 0:
+            return 0.0, 0.0, 0.0, 0
+        now = time.time()
+        with self._lock:
+            self.bestBid = bid
+            self.bestAsk = ask
+            self.lastUpdate = now
+            self.tickSeq += 1
+            seq = self.tickSeq
+        return bid, ask, now, seq
+
     def bestBidAsk(self):
         stale_sec = float(getattr(self.cfg, "wsStaleSec", 3.0))
         now = time.time()
@@ -118,6 +142,9 @@ class Stream:
             a = self.bestAsk
             lu = self.lastUpdate
         if b <= 0 or a <= 0 or lu <= 0 or (now - lu) > stale_sec:
+            fb, fa, _fl, _fs = self._rest_fallback()
+            if fb > 0 and fa > 0:
+                return fb, fa
             return 0.0, 0.0
         return b, a
 
@@ -130,5 +157,8 @@ class Stream:
             lu = self.lastUpdate
             seq = self.tickSeq
         if b <= 0 or a <= 0 or lu <= 0 or (now - lu) > stale_sec:
+            fb, fa, flu, fseq = self._rest_fallback()
+            if fb > 0 and fa > 0:
+                return fb, fa, flu, fseq
             return 0.0, 0.0, 0.0, 0
         return b, a, lu, seq
