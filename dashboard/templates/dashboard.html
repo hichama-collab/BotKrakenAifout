@@ -1,0 +1,171 @@
+{% extends 'base.html' %}
+{% block title %}Live{% endblock %}
+
+{% block scripts %}
+<script>window.__sseActive = true;</script>
+{% endblock %}
+
+{% block content %}
+<div x-data="botDashboard()" x-init="init()" class="page-content dashboard-live">
+  <div x-show="loading" class="live-loading">
+    <div class="skeleton"></div>
+    <div class="skeleton"></div>
+  </div>
+
+  <div x-show="error" x-cloak class="error-banner compact-banner"
+       x-text="'Erreur: ' + error"></div>
+
+  <section x-show="!loading" x-cloak class="health-strip" :class="healthClass">
+    <div class="health-indicator" aria-hidden="true"></div>
+    <div class="health-copy">
+      <strong x-text="healthState.title"></strong>
+      <span x-text="healthState.detail"></span>
+    </div>
+    <a class="health-action" :href="healthHref" x-text="healthState.action"></a>
+  </section>
+
+  <section x-show="!loading" x-cloak class="trading-surface">
+    <header class="live-symbol-header">
+      <div class="live-symbol">
+        <span class="market-dot" :class="botStatus === 'active' ? 'is-live' : 'is-off'"></span>
+        <div>
+          <strong x-text="fmtSymbol(activeToken) || '—'"></strong>
+          <span>
+            <span x-text="profile"></span>
+            <span> · </span>
+            <span x-text="control.mode === 'auto' ? 'Auto' : 'Manuel'"></span>
+          </span>
+        </div>
+      </div>
+      <div class="live-status">
+        <span class="badge" :class="botStatusClass" x-text="botStatus"></span>
+        <span x-text="fmtDuration(botSince)"></span>
+      </div>
+    </header>
+
+    <div class="live-pnl-strip">
+      <div>
+        <span>Aujourd'hui</span>
+        <strong class="num" :class="pnlClass(pnlToday?.usdc)"
+                x-text="fmtUsdc(pnlToday?.usdc)"></strong>
+      </div>
+      <div>
+        <span>Session</span>
+        <strong class="num" :class="pnlClass(pnlSession?.usdc)"
+                x-text="fmtUsdc(pnlSession?.usdc)"></strong>
+      </div>
+      <div>
+        <span>Semaine</span>
+        <strong class="num" :class="pnlClass(pnlWeek?.usdc)"
+                x-text="fmtUsdc(pnlWeek?.usdc)"></strong>
+      </div>
+    </div>
+
+    <div id="position-live" class="live-position" :class="{'has-position': hasPosition}">
+      <div class="live-position-title">
+        <span class="position-state-dot" :class="hasPosition ? 'open' : 'idle'"></span>
+        <strong x-text="hasPosition ? 'Position ouverte' : 'Aucune position'"></strong>
+        <span x-show="hasPosition" x-text="fmtAgo(activePosition?.ts_entry || activePosition?.ts || activePosition?.opened_at)"></span>
+      </div>
+      <div class="live-position-values">
+        <div>
+          <span>Entrée</span>
+          <strong class="num" x-text="fmtPrice(activePosition?.entry_price || activePosition?.entry || activePosition?.price)"></strong>
+        </div>
+        <div>
+          <span>Actuel</span>
+          <strong class="num" x-text="fmtPrice(activePosition?.current_price || monitorMetrics.bid)"></strong>
+        </div>
+        <div>
+          <span>PnL</span>
+          <strong class="num" :class="pnlClass(activePosition?.pnl_usdc)"
+                  x-text="hasPosition ? fmtUsdc(activePosition?.pnl_usdc) : '—'"></strong>
+        </div>
+        <div>
+          <span>PnL %</span>
+          <strong class="num" :class="pnlClass(activePosition?.pnl_pct)"
+                  x-text="hasPosition ? fmtPct(activePosition?.pnl_pct) : '—'"></strong>
+        </div>
+      </div>
+    </div>
+
+    <div class="market-metrics">
+      <div><span>Bid</span><strong class="num" x-text="fmtPrice(monitorMetrics.bid)"></strong></div>
+      <div><span>Ask</span><strong class="num" x-text="fmtPrice(monitorMetrics.ask)"></strong></div>
+      <div><span>Spread</span><strong class="num" x-text="fmtMetric(monitorMetrics.spread_pct, 4, '%')"></strong></div>
+      <div><span>Momentum</span><strong class="num" :class="pnlClass(monitorMetrics.mom_pct)" x-text="fmtMetric(monitorMetrics.mom_pct, 2, '%')"></strong></div>
+      <div><span>Range</span><strong class="num" x-text="fmtMetric(monitorMetrics.mom_range_pct, 2, '%')"></strong></div>
+      <div><span>Up ratio</span><strong class="num" x-text="fmtMetric(monitorMetrics.up_ratio, 1, '%')"></strong></div>
+    </div>
+
+    <footer class="decision-line">
+      <div>
+        <span class="badge" :class="decisionBadgeClass" x-text="decisionLabel"></span>
+        <span class="decision-age" x-text="`Data ${fmtAgeSec(monitorMetrics.age_sec)}`"></span>
+      </div>
+      <p :title="monitorDecision.detail || ''"
+         x-text="monitorDecision.detail || 'En attente du prochain signal exploitable'"></p>
+    </footer>
+  </section>
+
+  <section x-show="!loading" x-cloak class="compact-section">
+    <header class="section-heading">
+      <span>Trades récents</span>
+      <a href="/stats">Historique</a>
+    </header>
+
+    <div x-show="tradesLoading" class="compact-loading">
+      <div class="skeleton"></div>
+      <div class="skeleton"></div>
+    </div>
+    <div x-show="!tradesLoading && trades.length === 0" class="compact-empty">
+      Aucun trade récent
+    </div>
+
+    <div x-show="!tradesLoading && trades.length > 0" class="trade-ledger">
+      <template x-for="(t, i) in trades.slice(0,6)" :key="t.trade_key || i">
+        <article class="trade-ledger-row">
+          <div class="trade-primary">
+            <div>
+              <a :href="krakenUrl(t.symbol)" target="_blank" rel="noopener"
+                 x-text="fmtSymbol(t.symbol)"></a>
+              <span x-text="fmtTsShort(t.ts_epoch)"></span>
+            </div>
+            <strong class="num" :class="pnlClass(t.pnl_usdc)"
+                    x-text="fmtUsdc(t.pnl_usdc)"></strong>
+          </div>
+          <div class="trade-secondary">
+            <span class="num" x-text="`${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}`"></span>
+            <span class="num" :class="pnlClass(t.pnl_pct)" x-text="fmtPct(t.pnl_pct)"></span>
+          </div>
+          <details class="trade-reason">
+            <summary x-text="fmtReason(t.reason)"></summary>
+            <p x-text="t.reason || '—'"></p>
+          </details>
+        </article>
+      </template>
+    </div>
+  </section>
+
+  <section x-show="!loading && equityHasData" x-cloak class="compact-section equity-section">
+    <header class="section-heading">
+      <span>Equity</span>
+      <div class="chart-tabs">
+        <template x-for="r in ['1d','7d','30d','all']" :key="r">
+          <button class="chart-tab" :class="{ active: equityRange === r }"
+                  @click="loadEquity(r)" :disabled="equityLoading"
+                  x-text="r.toUpperCase()"></button>
+        </template>
+      </div>
+    </header>
+    <div class="chart-wrapper">
+      <div id="equity-chart-main" class="chart-container"></div>
+    </div>
+  </section>
+
+  <section x-show="!loading && !equityLoading && !equityHasData" x-cloak
+           class="compact-empty equity-empty">
+    Courbe equity indisponible pour cette période
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,203 @@
+{% extends 'base.html' %}
+{% block title %}Stats{% endblock %}
+
+{% block content %}
+<div x-data="botStats()" x-init="init()" class="page-content stats-page">
+  <div x-show="error" x-cloak class="error-banner compact-banner"
+       x-text="'Erreur: ' + error"></div>
+
+  <header class="page-heading">
+    <div>
+      <h1>Statistiques</h1>
+      <span x-text="`${stats.trades_total ?? 0} trades clôturés`"></span>
+    </div>
+    <button @click="fetchSnapshot(); fetchTrades()" class="icon-command" title="Actualiser" aria-label="Actualiser">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v6h6M20 20v-6h-6M20 9a8 8 0 00-14.8-3M4 15a8 8 0 0014.8 3"/>
+      </svg>
+    </button>
+  </header>
+
+  <section class="stats-board">
+    <div class="stats-board-title">Performance</div>
+    <div class="stats-board-grid pnl-grid">
+      <template x-for="(label, key) in {today: 'Aujourd’hui', session: 'Session', week: 'Semaine', month: 'Mois', year: 'Année'}" :key="key">
+        <div class="stats-cell">
+          <span x-text="label"></span>
+          <strong class="num" :class="pnlClass(pnl[key]?.usdc)"
+                  x-text="fmtUsdc(pnl[key]?.usdc)"></strong>
+          <small class="num" x-text="pnl[key]?.eur != null ? fmtEur(pnl[key].eur) : '—'"></small>
+        </div>
+      </template>
+    </div>
+  </section>
+
+  <section class="stats-board">
+    <div class="stats-board-title">Risque et efficacité</div>
+    <div class="stats-board-grid">
+      <div class="stats-cell">
+        <span>Total trades</span>
+        <strong class="num" x-text="stats.trades_total ?? '—'"></strong>
+      </div>
+      <div class="stats-cell">
+        <span>Winrate</span>
+        <strong class="num" :class="(stats.winrate ?? 0) >= 0.5 ? 'profit' : 'loss'"
+                x-text="stats.winrate != null ? (stats.winrate * 100).toFixed(1) + '%' : '—'"></strong>
+      </div>
+      <div class="stats-cell">
+        <span>Profit factor</span>
+        <strong class="num" :class="(stats.profit_factor ?? 0) >= 1 ? 'profit' : 'loss'"
+                x-text="stats.profit_factor != null ? stats.profit_factor.toFixed(2) : '—'"></strong>
+      </div>
+      <div class="stats-cell">
+        <span>Max drawdown</span>
+        <strong class="num loss" x-text="fmtUsdc(stats.drawdown_max)"></strong>
+      </div>
+    </div>
+  </section>
+
+  <section class="stats-detail-strip">
+    <div><span>Gain moy.</span><strong class="num profit" x-text="fmtUsdc(stats.avg_win)"></strong></div>
+    <div><span>Perte moy.</span><strong class="num loss" x-text="fmtUsdc(stats.avg_loss)"></strong></div>
+    <div><span>Meilleur</span><strong class="num profit" x-text="fmtUsdc(stats.best_trade)"></strong></div>
+    <div><span>Pire</span><strong class="num loss" x-text="fmtUsdc(stats.worst_trade)"></strong></div>
+    <div><span>Série +</span><strong class="num" x-text="stats.win_streak_max ?? '—'"></strong></div>
+    <div><span>Série -</span><strong class="num" x-text="stats.loss_streak_max ?? '—'"></strong></div>
+  </section>
+
+  <section class="token-rankings">
+    <div class="token-ranking-panel">
+      <header>
+        <span class="ranking-mark best"></span>
+        <strong>Meilleurs tokens</strong>
+      </header>
+      <div x-show="tokenRankings.top.length === 0" class="ranking-empty">Aucune donnée</div>
+      <template x-for="row in tokenRankings.top" :key="'top-' + row.symbol">
+        <a class="token-ranking-row" :href="krakenUrl(row.symbol)" target="_blank" rel="noopener">
+          <div>
+            <strong x-text="fmtSymbol(row.symbol)"></strong>
+            <span x-text="`${row.trades} trade${row.trades > 1 ? 's' : ''} · ${(row.winrate * 100).toFixed(0)}% win`"></span>
+          </div>
+          <b class="num" :class="pnlClass(row.pnl_usdc)" x-text="fmtUsdc(row.pnl_usdc)"></b>
+        </a>
+      </template>
+    </div>
+    <div class="token-ranking-panel">
+      <header>
+        <span class="ranking-mark worst"></span>
+        <strong>Plus mauvais</strong>
+      </header>
+      <div x-show="tokenRankings.bottom.length === 0" class="ranking-empty">Aucune donnée</div>
+      <template x-for="row in tokenRankings.bottom" :key="'bottom-' + row.symbol">
+        <a class="token-ranking-row" :href="krakenUrl(row.symbol)" target="_blank" rel="noopener">
+          <div>
+            <strong x-text="fmtSymbol(row.symbol)"></strong>
+            <span x-text="`${row.trades} trade${row.trades > 1 ? 's' : ''} · ${(row.winrate * 100).toFixed(0)}% win`"></span>
+          </div>
+          <b class="num" :class="pnlClass(row.pnl_usdc)" x-text="fmtUsdc(row.pnl_usdc)"></b>
+        </a>
+      </template>
+    </div>
+  </section>
+
+  <section class="compact-section stats-history">
+    <header class="section-heading history-heading">
+      <span>Historique des trades</span>
+      <div>
+        <input type="search" class="compact-search" placeholder="Symbole ou raison"
+               x-model="tradesFilter" @input="tradesPage = 1" />
+        <small x-text="`${filteredTrades.length} lignes`"></small>
+      </div>
+    </header>
+
+    <div x-show="tradesLoading" class="compact-loading">
+      <div class="skeleton"></div>
+      <div class="skeleton"></div>
+    </div>
+    <div x-show="!tradesLoading && filteredTrades.length === 0" class="compact-empty">
+      Aucun trade
+    </div>
+
+    <div x-show="!tradesLoading && filteredTrades.length > 0" class="stats-mobile-ledger">
+      <template x-for="(t, i) in pagedTrades" :key="t.trade_key || i">
+        <article class="trade-ledger-row">
+          <div class="trade-primary">
+            <div>
+              <a :href="krakenUrl(t.symbol)" target="_blank" rel="noopener"
+                 x-text="fmtSymbol(t.symbol)"></a>
+              <span x-text="fmtTsShort(t.ts_epoch)"></span>
+            </div>
+            <strong class="num" :class="pnlClass(t.pnl_usdc)"
+                    x-text="fmtUsdc(t.pnl_usdc)"></strong>
+          </div>
+          <div class="trade-secondary">
+            <span class="num" x-text="`${fmtPrice(t.entry_price)} → ${fmtPrice(t.exit_price)}`"></span>
+            <span class="num" :class="pnlClass(t.pnl_pct)" x-text="fmtPct(t.pnl_pct)"></span>
+          </div>
+          <details class="trade-reason">
+            <summary x-text="fmtReason(t.reason)"></summary>
+            <p x-text="t.reason || '—'"></p>
+          </details>
+        </article>
+      </template>
+    </div>
+
+    <div x-show="!tradesLoading && filteredTrades.length > 0" class="table-scroll stats-desktop-table">
+      <table class="data-table compact-table">
+        <thead>
+          <tr>
+            <th @click="sortBy('ts_epoch')">Date UTC</th>
+            <th>Symbole</th>
+            <th class="text-right">Entrée</th>
+            <th class="text-right">Sortie</th>
+            <th class="text-right">PnL USDC</th>
+            <th class="text-right">PnL %</th>
+            <th>Raison</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="(t, i) in pagedTrades" :key="t.trade_key || i">
+            <tr>
+              <td class="num" x-text="fmtTs(t.ts_epoch)"></td>
+              <td><a :href="krakenUrl(t.symbol)" target="_blank" rel="noopener"
+                     class="symbol-link" x-text="fmtSymbol(t.symbol)"></a></td>
+              <td class="text-right num" x-text="fmtPrice(t.entry_price)"></td>
+              <td class="text-right num" x-text="fmtPrice(t.exit_price)"></td>
+              <td class="text-right num" :class="pnlClass(t.pnl_usdc)" x-text="fmtUsdc(t.pnl_usdc)"></td>
+              <td class="text-right num" :class="pnlClass(t.pnl_pct)" x-text="fmtPct(t.pnl_pct)"></td>
+              <td class="reason-cell" :title="t.reason || ''" x-text="fmtReason(t.reason)"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
+
+    <footer x-show="!tradesLoading && totalPages > 1" class="compact-pagination">
+      <button class="icon-command" :disabled="tradesPage <= 1" @click="tradesPage--" aria-label="Page précédente">‹</button>
+      <span><b x-text="tradesPage"></b> / <span x-text="totalPages"></span></span>
+      <button class="icon-command" :disabled="tradesPage >= totalPages" @click="tradesPage++" aria-label="Page suivante">›</button>
+    </footer>
+  </section>
+
+  <section x-show="equityHasData" x-cloak class="compact-section equity-section">
+    <header class="section-heading">
+      <span>Equity cumulée</span>
+      <div class="chart-tabs">
+        <template x-for="r in ['1d','7d','30d','all']" :key="r">
+          <button class="chart-tab" :class="{ active: equityRange === r }"
+                  @click="loadEquity(r)" :disabled="equityLoading"
+                  x-text="r.toUpperCase()"></button>
+        </template>
+      </div>
+    </header>
+    <div class="chart-wrapper">
+      <div id="equity-chart-stats" class="chart-container-lg"></div>
+    </div>
+  </section>
+
+  <section x-show="!equityLoading && !equityHasData" x-cloak
+           class="compact-empty equity-empty">
+    Courbe equity indisponible pour cette période
+  </section>
+</div>
+{% endblock %}

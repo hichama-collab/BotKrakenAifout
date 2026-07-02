@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Kraken token profile selector periodically
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+Unit=kraken-token-profile-selector.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Kraken token profile selector
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/kraken-aifout-bot
+EnvironmentFile=-/opt/kraken-aifout-bot/.service.env
+ExecStart=/opt/kraken-aifout-bot/.venv/bin/python /opt/kraken-aifout-bot/TokenProfileSelector.py

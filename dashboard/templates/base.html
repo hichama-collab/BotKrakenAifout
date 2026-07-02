@@ -1,0 +1,130 @@
+{# === FILE: dashboard/templates/base.html === #}
+<!DOCTYPE html>
+<html lang="fr" class="dark" x-data x-init="
+  const saved = localStorage.getItem('theme');
+  if (saved === 'light') document.documentElement.classList.remove('dark'), document.documentElement.classList.add('light');
+">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0D1117" />
+  <meta name="description" content="Kraken AiFout Bot Dashboard" />
+  <title>{% block title %}BotDash{% endblock %} — AiFout</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            'bg-primary':   '#0D1117',
+            'bg-card':      '#171D25',
+            'bg-tertiary':  '#222A35',
+            'border-color': '#2A3441',
+            'text-primary':   '#EAECEF',
+            'text-secondary': '#B7BDC6',
+            'text-muted':     '#848E9C',
+            'accent':  '#F0B90B',
+            'profit':  '#36C991',
+            'loss':    '#EC6A7A',
+          },
+          fontFamily: {
+            sans: ['Inter', 'system-ui', 'sans-serif'],
+            mono: ['JetBrains Mono', 'SF Mono', 'Fira Code', 'monospace'],
+          },
+        },
+      },
+    };
+  </script>
+
+  <!-- Lightweight Charts CDN -->
+  <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+
+  <!-- Alpine.js CDN (load before app.js) -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.1/dist/cdn.min.js"></script>
+
+  <!-- Custom CSS -->
+  <link rel="stylesheet" href="/static/app.css" />
+
+  {% block head_extra %}{% endblock %}
+</head>
+<body class="bg-[#0D1117] text-[#EAECEF] font-sans antialiased">
+
+{# ===== Toast container (global) ===== #}
+<div x-data="toastManager()" class="toast-container" id="toast-root">
+  <template x-for="t in toasts" :key="t.id">
+    <div class="toast"
+         :class="`toast-${t.type}`"
+         @click="dismiss(t.id)"
+         role="alert">
+      <span x-show="t.type==='success'" class="text-[#36C991] flex-shrink-0">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+          <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.707-9.293a1 1 0 00-1.414-1.414L9 10.586 7.707 9.293a1 1 0 00-1.414 1.414l2 2a1 1 0 001.414 0l4-4z" clip-rule="evenodd"/>
+        </svg>
+      </span>
+      <span x-show="t.type==='error'" class="text-[#EC6A7A] flex-shrink-0">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+          <path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z" clip-rule="evenodd"/>
+        </svg>
+      </span>
+      <span x-show="t.type==='warn'" class="text-[#F0B90B] flex-shrink-0">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 20 20" fill="currentColor">
+          <path fill-rule="evenodd" d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l5.58 9.92c.75 1.334-.213 2.98-1.742 2.98H4.42c-1.53 0-2.493-1.646-1.743-2.98l5.58-9.92zM11 13a1 1 0 11-2 0 1 1 0 012 0zm-1-8a1 1 0 00-1 1v3a1 1 0 002 0V6a1 1 0 00-1-1z" clip-rule="evenodd"/>
+        </svg>
+      </span>
+      <span class="text-[#B7BDC6] flex-1" x-text="t.msg"></span>
+      <button class="text-[#848E9C] hover:text-[#EAECEF] ml-2 flex-shrink-0" @click.stop="dismiss(t.id)">✕</button>
+    </div>
+  </template>
+</div>
+
+{# ===== Topbar ===== #}
+{% include 'components/_topbar.html' %}
+
+{# ===== Main content ===== #}
+<main>
+  {% block content %}{% endblock %}
+</main>
+
+{# ===== Bottom nav (mobile) ===== #}
+{% include 'components/_bottomnav.html' %}
+
+{# ===== App JS ===== #}
+<script src="/static/app.js"></script>
+
+{# Ping polling — maintient le badge Live vert sur toutes les pages sauf Live (SSE) #}
+<script>
+  (function() {
+    if (window.__sseActive) return;
+    var dot = document.getElementById('sse-global-dot');
+    var lbl = document.getElementById('sse-global-label');
+    function ping() {
+      fetch('/api/ping', { credentials: 'same-origin' })
+        .then(function(r) {
+          var ok = r.ok;
+          window.__sseStatus = ok ? 'connected' : 'error';
+          if (dot) dot.className = 'sse-dot ' + (ok ? 'connected' : 'error');
+          if (lbl) lbl.textContent = ok ? 'Live' : 'Erreur';
+        })
+        .catch(function() {
+          window.__sseStatus = 'error';
+          if (dot) dot.className = 'sse-dot error';
+          if (lbl) lbl.textContent = 'Hors ligne';
+        });
+    }
+    ping();
+    setInterval(ping, 5000);
+  })();
+</script>
+
+{% block scripts %}{% endblock %}
+
+</body>
+</html>

@@ -1,0 +1,33 @@
+profiles:
+  default:
+    symbol: BTCUSDC
+    rangeTimeframe: 5m
+    rangeWindowBars: 24
+    contextWindowBars: 72
+    rangeRefreshSec: 30.0
+    minRangePct: 0.0025
+    maxRangePct: 0.0180
+    trendMaxDriftPct: 0.0120
+    buyZoneFrac: 0.22
+    targetZoneFrac: 0.78
+    stopRangeFrac: 0.14
+    minRewardRisk: 1.25
+    reboundConfirmTicks: 3
+    reboundMinPct: 0.00035
+    ticksKeepSec: 900.0
+    spreadMaxPct: 0.0008
+    entryCrossSpread: false
+    entryAutoCrossSpreadPct: 0.00020
+    maxUsdcPerTrade: 75.0
+    minOrderNotionalUsdc: 10.0
+    protectActivateFrac: 0.35
+    protectLockFrac: 0.10
+    maxHoldSec: 7200.0
+    staleAfterSec: 1800.0
+    staleMinProgressFrac: 0.12
+    entryCooldownSec: 180.0
+    cooldownWinSec: 90.0
+    cooldownLossSec: 240.0
+    chkEvery: 30.0
+    idleSleep: 0.5
+    allowExistingBaseBalance: false

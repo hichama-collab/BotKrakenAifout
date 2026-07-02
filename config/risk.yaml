@@ -1,0 +1,628 @@
+profile_aliases:
+  strict: strict
+  aggressive: aggressive
+
+profiles:
+  strict:
+    cap_usdc: 1000
+    mom_min_up_ratio: 0.55
+    mom_min_pct: 0.0008
+    mom_window_sec: 12
+    mom_range_min_pct: 0
+    mom_use_instant: false
+    mom_lookback: 5
+    mom_max_age_sec: 3.0
+    spread_max: 0.0010
+    rsi_min: 35
+    rsi_max: 75
+    rsi_buy_max: 70
+    entry_fill_ttl_sec: 2.0
+    entry_cooldown_sec: 30
+    entry_cross_spread: false
+    entry_auto_cross_spread_pct: 0.0004
+    hold_csv_every: 10
+    hold_log_every: 5
+    dust_cooldown_sec: 60
+    wallet_flat_cooldown_sec: 300
+    allow_warmup_entry: false
+    ticks_keep_min_sec: 60
+    riskPct: 0.0060
+    tpPct: 0.0085
+    tp_min_pct: 0.0060
+    tp_net_margin_pct: 0.0030
+    armPct: 0.0030
+    trailPct: 0.0030
+    feeBufPct: 0.0015
+    protect_arm_pct: 0.0030
+    protect_lock_pct: 0.0022
+    protect_giveback_pct: 0.0012
+    psell_min_age_sec: 45
+    psell_min_loss_pct: 0.0035
+    psell_current_loss_pct: 0.0030
+    psell_stale_age_sec: 140
+    psell_stale_loss_pct: 0.0020
+    psell_confirm_ticks: 4
+    psell_fail_age_sec: 45
+    psell_fail_loss_pct: 0.0022
+    psell_fail_max_high_pct: 0.0015
+    psell_allow_negative_exit: false
+    psell_strict_p_tape_exit_enabled: true
+    psell_5m_age_sec: 0
+    reentry_loss_cooldown_sec: 180
+    reentry_trail_cooldown_sec: 60
+    reentry_recovery_pct: 0.0015
+    reentry_recovery_max_age_sec: 1800
+    p_entry_enabled: true
+    p_sample_interval_sec: 0
+    entry_hard_min_up_ratio: 0.55
+    entry_min_strict_ups: 2
+    entry_min_tape_progress_pct: 0.00025
+    entry_min_tape_progress_vs_spread: 1.0
+    entry_fee_edge_mult: 1.25
+    entry_min_net_edge_mult: 1.20
+    min_profit_buffer_pct: 0.0010
+    flow_defense_enabled: false
+    flow_lookback: 8
+    flow_min_ratio: 1.20
+    flow_max_single_drop_pct: 0.0025
+    burst_entry_enabled: false
+    burst_min_net_edge_mult: 1.25
+    min_order_notional_usdc: 5.0
+    min_filled_notional_usdc: 6.0
+    topup_after_partial_buy: true
+    topup_max_attempts: 2
+    fee_rate: 0.001
+    daily_max_loss_usdc: 1.0
+    max_consecutive_losses: 3
+    token_quality_override_manual_symbol: true
+    entry_ema_filter_enabled: true
+    burst_ema_filter_enabled: true
+    position_dynamics_enabled: true
+    trailing_stop_enabled: true
+    trailing_stop_drawdown_pct: 0.004
+    trailing_stop_min_gain_arming_pct: 0.003
+    breakeven_escape_enabled: true
+    breakeven_escape_min_gain_arming_pct: 0.003
+    breakeven_escape_buffer_pct: 0.0005
+    return_to_entry_enabled: true
+    return_to_entry_min_drawdown_pct: 0.0020
+    return_to_entry_trigger_below_entry_pct: 0.0005
+    return_to_entry_min_age_sec: 120
+    entry_guard_enabled: true
+    entry_guard_min_age_sec: 45
+    entry_guard_arm_gain_pct: 0.0030
+    entry_guard_net_floor_pct: 0.0002
+    entry_guard_giveback_pct: 0.0015
+    entry_guard_loss_cut_pct: 0.0025
+    entry_guard_loss_age_sec: 90
+    pic_filter_enabled: true
+    pic_filter_lookback_sec: 180
+    pic_filter_threshold_pct: 0.0015
+
+  aggressive:
+    cap_usdc: 1000
+    mom_min_up_ratio: 0.45
+    mom_min_pct: 0.0006
+    mom_window_sec: 12
+    mom_range_min_pct: 0
+    mom_use_instant: false
+    mom_lookback: 5
+    mom_max_age_sec: 3.0
+    spread_max: 0.0015
+    rsi_min: 30
+    rsi_max: 82
+    rsi_buy_max: 74
+    entry_fill_ttl_sec: 2.0
+    entry_cooldown_sec: 20
+    entry_cross_spread: false
+    entry_auto_cross_spread_pct: 0.0006
+    hold_csv_every: 10
+    hold_log_every: 5
+    dust_cooldown_sec: 60
+    wallet_flat_cooldown_sec: 240
+    allow_warmup_entry: false
+    ticks_keep_min_sec: 60
+    riskPct: 0.0070
+    tpPct: 0.0090
+    tp_min_pct: 0.0060
+    tp_net_margin_pct: 0.0030
+    armPct: 0.0030
+    trailPct: 0.0032
+    feeBufPct: 0.0015
+    protect_arm_pct: 0.0030
+    protect_lock_pct: 0.0020
+    protect_giveback_pct: 0.0012
+    psell_min_age_sec: 45
+    psell_min_loss_pct: 0.0035
+    psell_current_loss_pct: 0.0030
+    psell_stale_age_sec: 120
+    psell_stale_loss_pct: 0.0020
+    psell_confirm_ticks: 4
+    psell_fail_age_sec: 45
+    psell_fail_loss_pct: 0.0022
+    psell_fail_max_high_pct: 0.0015
+    psell_allow_negative_exit: false
+    psell_strict_p_tape_exit_enabled: true
+    psell_5m_age_sec: 0
+    reentry_loss_cooldown_sec: 150
+    reentry_trail_cooldown_sec: 60
+    reentry_recovery_pct: 0.0012
+    reentry_recovery_max_age_sec: 1800
+    p_entry_enabled: true
+    p_sample_interval_sec: 0
+    entry_hard_min_up_ratio: 0.45
+    entry_min_strict_ups: 2
+    entry_min_tape_progress_pct: 0.00020
+    entry_min_tape_progress_vs_spread: 0.9
+    entry_fee_edge_mult: 1.10
+    entry_min_net_edge_mult: 1.10
+    min_profit_buffer_pct: 0.0007
+    flow_defense_enabled: false
+    flow_lookback: 8
+    flow_min_ratio: 1.15
+    flow_max_single_drop_pct: 0.0025
+    burst_entry_enabled: false
+    burst_min_net_edge_mult: 1.25
+    min_order_notional_usdc: 5.0
+    min_filled_notional_usdc: 6.0
+    topup_after_partial_buy: true
+    topup_max_attempts: 2
+    fee_rate: 0.001
+    daily_max_loss_usdc: 2.0
+    max_consecutive_losses: 4
+    token_quality_override_manual_symbol: true
+    entry_ema_filter_enabled: true
+    burst_ema_filter_enabled: true
+    position_dynamics_enabled: true
+    trailing_stop_enabled: true
+    trailing_stop_drawdown_pct: 0.004
+    trailing_stop_min_gain_arming_pct: 0.003
+    breakeven_escape_enabled: true
+    breakeven_escape_min_gain_arming_pct: 0.003
+    breakeven_escape_buffer_pct: 0.0005
+    return_to_entry_enabled: true
+    return_to_entry_min_drawdown_pct: 0.0020
+    return_to_entry_trigger_below_entry_pct: 0.0005
+    return_to_entry_min_age_sec: 120
+    entry_guard_enabled: true
+    entry_guard_min_age_sec: 45
+    entry_guard_arm_gain_pct: 0.0030
+    entry_guard_net_floor_pct: 0.0002
+    entry_guard_giveback_pct: 0.0015
+    entry_guard_loss_cut_pct: 0.0025
+    entry_guard_loss_age_sec: 90
+    pic_filter_enabled: true
+    pic_filter_lookback_sec: 180
+    pic_filter_threshold_pct: 0.0012
+
+  major:
+    mom_min_up_ratio: 0.38     # was 0.45
+    mom_range_min_pct: 0
+    mom_use_instant: false
+    mom_lookback: 5
+    mom_max_age_sec: 3.0
+    ob_imbalance_min_ratio: 0.0
+    ob_depth_levels: 5
+    tick_confirmation_enabled: false
+    tick_confirmation_lookback: 3
+    tick_confirmation_min_pct: 0.0004
+    spread_max: 0.0018
+    rsi_min: 25
+    rsi_max: 90
+    entry_fill_ttl_sec: 2.0    # was 1.5
+    entry_cooldown_sec: 20
+    entry_cross_spread: false
+    entry_auto_cross_spread_pct: 0.0006
+    hold_csv_every: 10
+    hold_log_every: 5
+    dust_cooldown_sec: 30
+    dust_step_fraction: 0.5
+    qty_mismatch_step_fraction: 0.5
+    wallet_max_retries: 2
+    wallet_retry_backoff_sec: 0.4
+    wallet_flat_cooldown_sec: 120
+    order_rest_max_retries: 3
+    order_rest_backoff_sec: 0.2
+    allow_warmup_entry: true
+    ticks_keep_min_sec: 40
+    mom_relax_strong_mult: 0.6
+    mom_relax_mid_mult: 0.8
+    riskPct: 0.008
+    tpPct: 0.008               # was 0.013 — cible plus réaliste (0.8%)
+    armPct: 0.004              # was 0.008 — trail s'arme plus tôt (0.4%)
+    trailPct: 0.004
+    feeBufPct: 0.0015
+    protect_arm_pct: 0.0040    # was 0.0024
+    protect_lock_pct: 0.0020   # was 0.0012
+    protect_giveback_pct: 0.0020  # was 0.0012
+    psell_min_age_sec: 80      # was 45 — plus de temps avant évaluation PSELL
+    psell_min_loss_pct: 0.0050 # was 0.0035
+    psell_current_loss_pct: 0.0040  # was 0.0026
+    psell_stale_age_sec: 140   # was 90 — plus de temps avant sortie stale
+    psell_stale_loss_pct: 0.0020    # was 0.0012
+    psell_confirm_ticks: 4
+    psell_fail_age_sec: 100    # was 55 — était trop agressif (coupait à 55s)
+    psell_fail_loss_pct: 0.0018     # was 0.0012
+    psell_fail_max_high_pct: 0.0018
+    psell_5m_age_sec: 0        # was 35 — ROLL5 désactivé
+    psell_5m_loss_pct: 0.0020  # was 0.0010
+    psell_5m_drop_pct: 0.0010
+    psell_5m_negative_ret_pct: -0.0002
+    reentry_loss_cooldown_sec: 180   # was 90 — s'applique maintenant aux bursts aussi
+    reentry_trail_cooldown_sec: 60
+    reentry_recovery_pct: 0.0015
+    reentry_recovery_max_age_sec: 1800
+    p_entry_enabled: true
+    entry_hard_min_up_ratio: 0.38 # was 0.45
+    entry_min_strict_ups: 2
+    entry_min_tape_progress_pct: 0.0002
+    entry_min_tape_progress_vs_spread: 0.85
+    flow_defense_enabled: false
+    flow_lookback: 8
+    flow_min_ratio: 1.15
+    flow_max_single_drop_pct: 0.0025
+    burst_entry_enabled: true
+    burst_lookback_ticks: 3    # was 4
+    burst_max_window_sec: 6.0  # was 2.5 — élargi: marché calme = ticks toutes les 2-3s
+    burst_min_return_pct: 0.00080  # filtrer les micro-mouvements non profitables
+    burst_min_return_vs_fee_buf: 0.8
+    burst_min_move_vs_spread: 4.0
+    burst_min_velocity_pct_per_sec: 0.00015  # was 0.00060 — ajusté pour fenêtre 6s
+    burst_min_efficiency: 0.70     # was 0.55 — burst plus directionnel
+    burst_min_pressure_ratio: 2.5  # was 1.8 — conviction acheteur plus forte
+    burst_max_single_drop_pct: 0.00030  # was 0.00010 — permet micro-corrections
+    burst_spread_max_mult: 1.6
+    burst_force_cross_spread: true
+    burst_exit_confirm_ticks: 3
+    burst_exit_giveback_mult: 0.55
+    burst_exit_min_drawdown_pct: 0.00010
+    burst_exit_drawdown_vs_spread: 6.0
+    burst_fail_ttl_sec: 8.0
+    burst_fail_loss_pct: 0.0025
+    burst_fail_loss_vs_spread: 2.5
+    burst_reversal_min_peak_pct: 0.0012
+    burst_follow_ttl_sec: 4.0
+    burst_follow_min_extension_pct: 0.00008
+    burst_exit_under_entry_pct: 0.00004
+    tp_min_pct: 0.004          # was 0.006
+    maxPosTime: 240
+    hardMaxPosTime: 1200
+    cap_usdc: 1000
+    mom_max_pct: 0.0020
+    rsi_buy_max: 70
+    mom_min_pct: 0.00050       # was 0.00035
+    mom_window_sec: 12         # was 8
+    min_range_entry_pct: 0.0002
+    min_range_vs_spread: 0.45
+    min_order_notional_usdc: 5.0
+    min_filled_notional_usdc: 6.0
+    topup_after_partial_buy: true
+    topup_max_attempts: 2
+    fee_rate: 0.001
+    daily_max_loss_usdc: 3.0
+
+  btc_48h:
+    cap_usdc: 1000
+    mom_window_sec: 35
+    mom_min_pct: 0.00012
+    mom_min_up_ratio: 0.38
+    mom_range_min_pct: 0
+    mom_use_instant: false
+    mom_lookback: 6
+    mom_max_age_sec: 4.0
+    ob_imbalance_min_ratio: 0.0
+    ob_depth_levels: 5
+    tick_confirmation_enabled: false
+    spread_max: 0.0006
+    rsi_min: 30
+    rsi_max: 82
+    entry_fill_ttl_sec: 3.0
+    entry_cooldown_sec: 60
+    entry_cross_spread: true
+    entry_auto_cross_spread_pct: 0.00008
+    hold_csv_every: 10
+    hold_log_every: 5
+    dust_cooldown_sec: 30
+    dust_step_fraction: 0.5
+    qty_mismatch_step_fraction: 0.5
+    wallet_max_retries: 2
+    wallet_retry_backoff_sec: 0.4
+    wallet_flat_cooldown_sec: 600
+    order_rest_max_retries: 3
+    order_rest_backoff_sec: 0.2
+    allow_warmup_entry: false
+    ticks_keep_min_sec: 180
+    mom_relax_strong_mult: 0.7
+    mom_relax_mid_mult: 0.9
+    riskPct: 0.0065
+    tpPct: 0.008
+    tp_min_pct: 0.004
+    armPct: 0.0032
+    trailPct: 0.0035
+    feeBufPct: 0.0012
+    protect_arm_pct: 0.003
+    protect_lock_pct: 0.0022
+    protect_giveback_pct: 0.0012
+    psell_min_age_sec: 90
+    psell_min_loss_pct: 0.003
+    psell_current_loss_pct: 0.0022
+    psell_stale_age_sec: 420
+    psell_stale_loss_pct: 0.0018
+    psell_confirm_ticks: 4
+    psell_fail_age_sec: 120
+    psell_fail_loss_pct: 0.002
+    psell_fail_max_high_pct: 0.0015
+    psell_allow_negative_exit: true
+    psell_strict_p_tape_exit_enabled: true
+    psell_5m_age_sec: 0
+    psell_5m_loss_pct: 0.003
+    psell_5m_drop_pct: 0.0015
+    psell_5m_negative_ret_pct: -0.0003
+    reentry_loss_cooldown_sec: 240
+    reentry_trail_cooldown_sec: 120
+    reentry_recovery_pct: 0.0008
+    reentry_recovery_max_age_sec: 1800
+    p_entry_enabled: true
+    p_sample_interval_sec: 20
+    entry_hard_min_up_ratio: 0.45
+    entry_min_strict_ups: 2
+    entry_min_tape_progress_pct: 0.00012
+    entry_min_tape_progress_vs_spread: 2.0
+    entry_fee_edge_mult: 0.0
+    flow_defense_enabled: true
+    flow_lookback: 10
+    flow_min_ratio: 1.25
+    flow_max_single_drop_pct: 0.0015
+    burst_entry_enabled: true
+    burst_require_tape: true
+    burst_lookback_ticks: 6
+    burst_max_window_sec: 45.0
+    burst_min_return_pct: 0.00015
+    burst_min_return_vs_fee_buf: 0.0
+    burst_min_move_vs_spread: 4.0
+    burst_min_velocity_pct_per_sec: 0.000004
+    burst_min_efficiency: 0.45
+    burst_min_pressure_ratio: 1.15
+    burst_max_single_drop_pct: 0.00030
+    burst_spread_max_mult: 1.4
+    burst_force_cross_spread: true
+    burst_exit_confirm_ticks: 4
+    burst_exit_giveback_mult: 0.65
+    burst_exit_min_drawdown_pct: 0.00100
+    burst_exit_drawdown_vs_spread: 10.0
+    burst_fail_ttl_sec: 20.0
+    burst_fail_loss_pct: 0.003
+    burst_fail_loss_vs_spread: 10.0
+    burst_reversal_min_peak_pct: 0.0025
+    burst_follow_ttl_sec: 8.0
+    burst_follow_min_extension_pct: 0.00008
+    burst_exit_under_entry_pct: 0.00008
+    maxPosTime: 3600
+    hardMaxPosTime: 0
+    mom_max_pct: 0.006
+    rsi_buy_max: 74
+    min_range_entry_pct: 0.00008
+    min_range_vs_spread: 3.0
+    min_order_notional_usdc: 5.0
+    min_filled_notional_usdc: 6.0
+    topup_after_partial_buy: true
+    topup_max_attempts: 2
+    fee_rate: 0.001
+    daily_max_loss_usdc: 1.0
+    max_consecutive_losses: 3
+    cooldown_after_break_sec: 7200
+    token_quality_override_manual_symbol: true
+    entry_ema_filter_enabled: true
+    burst_ema_filter_enabled: true
+    position_dynamics_enabled: true
+    trailing_stop_enabled: true
+    trailing_stop_drawdown_pct: 0.006
+    trailing_stop_min_gain_arming_pct: 0.004
+    breakeven_escape_enabled: true
+    breakeven_escape_min_gain_arming_pct: 0.0035
+    breakeven_escape_buffer_pct: 0.0005
+    return_to_entry_enabled: true
+    return_to_entry_min_drawdown_pct: 0.0020
+    return_to_entry_trigger_below_entry_pct: 0.0005
+    return_to_entry_min_age_sec: 120
+    entry_guard_enabled: true
+    entry_guard_min_age_sec: 60
+    entry_guard_arm_gain_pct: 0.004
+    entry_guard_net_floor_pct: 0.0002
+    entry_guard_giveback_pct: 0.003
+    entry_guard_loss_cut_pct: 0.0035
+    entry_guard_loss_age_sec: 180
+    pic_filter_enabled: false
+    pic_filter_lookback_sec: 300
+    pic_filter_threshold_pct: 0.0005
+
+  midcap:
+    cap_usdc: 10000
+    mom_window_sec: 16
+    mom_min_pct: 0.00025
+    mom_min_up_ratio: 0.7
+    mom_use_instant: false
+    mom_lookback: 5
+    mom_max_age_sec: 3.0
+    ob_imbalance_min_ratio: 0.0
+    ob_depth_levels: 5
+    tick_confirmation_enabled: false
+    tick_confirmation_lookback: 3
+    tick_confirmation_min_pct: 0.0004
+    spread_max: 0.008
+    rsi_min: 20
+    rsi_max: 92
+    entry_fill_ttl_sec: 3.0
+    entry_cooldown_sec: 12
+    entry_cross_spread: true
+    hold_csv_every: 10
+    hold_log_every: 5
+    dust_cooldown_sec: 30
+    dust_step_fraction: 0.5
+    qty_mismatch_step_fraction: 0.5
+    wallet_max_retries: 2
+    wallet_retry_backoff_sec: 0.4
+    order_rest_max_retries: 3
+    order_rest_backoff_sec: 0.2
+    allow_warmup_entry: true
+    ticks_keep_min_sec: 40
+    mom_relax_strong_mult: 0.6
+    mom_relax_mid_mult: 0.8
+    riskPct: 0.01
+    tpPct: 0.018
+    armPct: 0.015
+    trailPct: 0.008
+    feeBufPct: 0.0018
+    tp_min_pct: 0.004
+    maxPosTime: 300
+    hardMaxPosTime: 1200
+    min_order_notional_usdc: 5.0
+    fee_rate: 0.001
+    daily_max_loss_usdc: 3.0
+
+  wide_spread:
+    cap_usdc: 10000
+    mom_window_sec: 20
+    mom_min_pct: 0.00025
+    mom_min_up_ratio: 0.7
+    mom_use_instant: false
+    mom_lookback: 5
+    mom_max_age_sec: 3.0
+    ob_imbalance_min_ratio: 0.0
+    ob_depth_levels: 5
+    tick_confirmation_enabled: false
+    tick_confirmation_lookback: 3
+    tick_confirmation_min_pct: 0.0005
+    spread_max: 0.015
+    rsi_min: 15
+    rsi_max: 95
+    entry_fill_ttl_sec: 3.0
+    entry_cooldown_sec: 10
+    entry_cross_spread: true
+    hold_csv_every: 10
+    hold_log_every: 5
+    dust_cooldown_sec: 30
+    dust_step_fraction: 0.5
+    qty_mismatch_step_fraction: 0.5
+    wallet_max_retries: 2
+    wallet_retry_backoff_sec: 0.4
+    order_rest_max_retries: 3
+    order_rest_backoff_sec: 0.2
+    allow_warmup_entry: true
+    ticks_keep_min_sec: 40
+    mom_relax_strong_mult: 0.6
+    mom_relax_mid_mult: 0.8
+    riskPct: 0.012
+    tpPct: 0.02
+    armPct: 0.016
+    trailPct: 0.01
+    feeBufPct: 0.002
+    tp_min_pct: 0.004
+    maxPosTime: 360
+    hardMaxPosTime: 1200
+    min_order_notional_usdc: 5.0
+    fee_rate: 0.001
+    daily_max_loss_usdc: 3.0
+
+  fast_momo:
+    cap_usdc: 90
+    mom_window_sec: 180
+    mom_min_pct: 0.00025
+    mom_min_up_ratio: 0.7
+    mom_range_min_pct: 0
+    min_range_entry_pct: 0.0035
+    min_range_vs_spread: 4.0
+    mom_use_instant: true
+    mom_lookback: 4
+    mom_max_age_sec: 2.0
+    ob_imbalance_min_ratio: 0.0
+    ob_depth_levels: 5
+    tick_confirmation_enabled: false
+    tick_confirmation_lookback: 3
+    tick_confirmation_min_pct: 0.0004
+    spread_max: 0.006
+    rsi_min: 30
+    rsi_max: 92
+    entry_fill_ttl_sec: 2.5
+    entry_cooldown_sec: 10
+    entry_cross_spread: true
+    hold_csv_every: 10
+    hold_log_every: 5
+    dust_cooldown_sec: 30
+    dust_step_fraction: 0.5
+    qty_mismatch_step_fraction: 0.5
+    wallet_max_retries: 2
+    wallet_retry_backoff_sec: 0.4
+    order_rest_max_retries: 3
+    order_rest_backoff_sec: 0.2
+    allow_warmup_entry: true
+    ticks_keep_min_sec: 40
+    mom_relax_strong_mult: 0.6
+    mom_relax_mid_mult: 0.8
+    riskPct: 0.009
+    tpPct: 0.015
+    armPct: 0.012
+    trailPct: 0.008
+    feeBufPct: 0.0018
+    tp_min_pct: 0.004
+    maxPosTime: 240
+    hardMaxPosTime: 900
+    min_order_notional_usdc: 5.0
+    fee_rate: 0.001
+    daily_max_loss_usdc: 3.0
+
+  cap: 20
+
+strategies:
+  momentum: {}
+  reversal: {}
+  cap: 20
+
+# ── Fees ──────────────────────────────────────────────────────────────────────
+fees:
+  defaultFeeRate: 0.001        # 0.10% taker spot Kraken
+  useBnbForFees: false         # true = 25% discount via BNB
+  minProfitBufferPct: 0.0
+
+# ── Token Quality Score ───────────────────────────────────────────────────────
+tokenQuality:
+  enabled: true
+  minQualityScore: 0.3         # tokens en dessous → ignorés
+  minTradesForBlock: 5         # nbre minimum de trades pour bloquer
+  blockPnlThreshold: -0.10     # pnl_net_total < -0.10 USDC → bloqué
+  blockWinrateThreshold: 0.20  # winrate < 20% → bloqué
+  respectBlocked: true         # si false, les bloqués sont pénalisés mais pas exclus
+  rebuildOnStart: true         # rebuild token_quality.json au démarrage du selector
+
+# ── Pic Filter ────────────────────────────────────────────────────────────────
+picFilter:
+  enabled: true
+  lookbackSec: 180             # fenêtre de recherche du pic (secondes)
+  thresholdPct: 0.001          # 0.1% sous le pic = near peak
+
+# ── Position Dynamics + Trailing Stop + Breakeven ────────────────────────────
+positionDynamics:
+  enabled: true
+
+trailingStop:
+  enabled: true
+  drawdownPct: 0.004           # retrace 0.4% depuis le pic → sortie
+  minGainArmingPct: 0.003      # was 0.005 — s'arme dès 0.3% gain (cohérent avec tpPct 0.8%)
+
+breakevenEscape:
+  enabled: true
+  minGainArmingPct: 0.003      # s'arme si max_gain >= 0.3%
+  bufferPct: 0.0005            # 0.05% au-dessus du vrai breakeven
+
+# ── Entry Guard ──────────────────────────────────────────────────────────────
+# Repère défensif autour du prix d'achat:
+# - protège un trade qui revient vers breakeven après un gain
+# - coupe plus vite si le prix passe sous l'entry avec tape faible
+entryGuard:
+  enabled: true
+  minAgeSec: 3.0
+  armGainPct: 0.0025
+  netFloorPct: 0.0002
+  givebackPct: 0.0015
+  lossCutPct: 0.0015
+  lossAgeSec: 12.0

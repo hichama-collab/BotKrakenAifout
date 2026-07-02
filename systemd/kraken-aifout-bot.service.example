@@ -1,0 +1,16 @@
+[Unit]
+Description=Kraken AiFout Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/kraken-aifout-bot
+EnvironmentFile=/opt/kraken-aifout-bot/.env
+EnvironmentFile=/opt/kraken-aifout-bot/.service.env
+ExecStart=/opt/kraken-aifout-bot/.venv/bin/python /opt/kraken-aifout-bot/main.py ${SYMBOL}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

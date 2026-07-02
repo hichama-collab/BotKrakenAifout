@@ -1,0 +1,3596 @@
+#!/usr/bin/env python3
+import sys
+import time
+import os
+import json
+from pathlib import Path
+from decimal import Decimal, ROUND_CEILING
+
+from typing import Optional
+from execution.fee_model import FeeModel
+from state.persisted import PersistedPosition, save_position, load_position, clear_position, reconcile_with_wallet
+from risk.circuit_breaker import CircuitBreaker
+
+
+def momentum_ok(
+    ticks,
+    window_sec: float,
+    min_pct: float,
+    min_up_ratio: float,
+    range_min_pct: float,
+    range_relax_pct: float,
+    range_relax_up_ratio: float,
+    allow_warmup_entry: bool,
+):
+    """
+    ticks: list[(ts, bid)]
+    Retour: (ok, mom_pct, up_ratio, range_pct)
+
+    Tiered relaxation:
+    - momentum fort => tolérance up_ratio plus basse
+    - range fort => tolérance up_ratio et min_pct plus basses
+    """
+    if not ticks:
+        return False, 0.0, 0.0, 0.0
+
+    now = ticks[-1][0]
+    cutoff = now - window_sec
+    win = [(ts, bid) for ts, bid in ticks if ts >= cutoff]
+
+    if len(win) < 2:
+        return bool(allow_warmup_entry), 0.0, 0.0, 0.0
+
+    p0 = win[0][1]
+    p1 = win[-1][1]
+    if p0 <= 0 or p1 <= 0:
+        return False, 0.0, 0.0, 0.0
+
+    mom = (p1 - p0) / p0
+
+    ups = 0
+    tot = 0
+    last = win[0][1]
+    for _, b in win[1:]:
+        if b > last:
+            ups += 1
+            tot += 1
+        elif b < last:
+            tot += 1
+        last = b
+
+    up_ratio = (ups / tot) if tot else 0.0
+
+    win_prices = [bid for _, bid in win]
+    low = min(win_prices)
+    high = max(win_prices)
+    range_pct = ((high - low) / low) if low > 0 else 0.0
+
+    relaxed = min_up_ratio
+    relaxed_min_pct = min_pct
+    if mom >= min_pct * 4:
+        relaxed *= 0.6
+    elif mom >= min_pct * 2:
+        relaxed *= 0.8
+    if range_pct >= range_min_pct:
+        relaxed *= range_relax_up_ratio
+        relaxed_min_pct *= range_relax_pct
+
+    ok = (mom >= relaxed_min_pct) and (up_ratio >= relaxed)
+    return ok, mom, up_ratio, range_pct
+
+
+def instant_momentum_ok(ticks, threshold_pct: float, lookback: int, min_up_ratio: float):
+    # ticks: list[(ts, bid)] -> (ok, mom_pct, up_ratio)
+    if not ticks or len(ticks) < max(2, int(lookback)):
+        return False, 0.0, 0.0
+    lookback = int(lookback)
+    recent = ticks[-lookback:]
+    p0 = float(recent[0][1])
+    p1 = float(recent[-1][1])
+    if p0 <= 0 or p1 <= 0:
+        return False, 0.0, 0.0
+    mom = (p1 - p0) / p0
+    ups = 0
+    tot = 0
+    last = float(recent[0][1])
+    for _, b in recent[1:]:
+        b = float(b)
+        if b > last:
+            ups += 1
+            tot += 1
+        elif b < last:
+            tot += 1
+        last = b
+    up_ratio = (ups / tot) if tot else 0.0
+    ok = (mom >= float(threshold_pct)) and (up_ratio >= float(min_up_ratio))
+    return ok, mom, up_ratio
+
+
+
+def tick_confirmation_ok(ticks, lookback: int, min_pct: float):
+    """Tick-to-tick micro confirmation.
+    Requires monotone non-decreasing bids over last N ticks and total progress >= min_pct.
+    ticks: list[(ts, bid)] (uses bid side)
+    Returns (ok, prog)
+    """
+    if not ticks or len(ticks) < int(lookback):
+        return False, 0.0
+    lookback = max(2, int(lookback))
+    recent = ticks[-lookback:]
+    for i in range(1, len(recent)):
+        if float(recent[i][1]) < float(recent[i - 1][1]):
+            return False, 0.0
+    p0 = float(recent[0][1])
+    plast = float(recent[-1][1])
+    if p0 <= 0:
+        return False, 0.0
+    prog = (plast - p0) / p0
+    return (prog >= float(min_pct)), prog
+
+
+def flow_pressure_ok(ticks, lookback: int, min_ratio: float, max_single_drop_pct: float):
+    """Defensive tape quality filter.
+    Rejects fake strength where small upticks are repeatedly erased by larger downticks.
+    Uses recent MID ticks and compares cumulative up/down magnitudes.
+    Returns (ok, flow_ratio, worst_drop_pct, net_pct).
+    """
+    lookback = max(3, int(lookback))
+    if not ticks or len(ticks) < lookback:
+        return False, 0.0, 0.0, 0.0
+
+    recent = [float(px) for _, px in ticks[-lookback:]]
+    if recent[0] <= 0:
+        return False, 0.0, 0.0, 0.0
+
+    up_mag = 0.0
+    down_mag = 0.0
+    worst_drop_pct = 0.0
+    for i in range(1, len(recent)):
+        prev = float(recent[i - 1])
+        cur = float(recent[i])
+        if prev <= 0:
+            continue
+        d_pct = (cur - prev) / prev
+        if d_pct > 0:
+            up_mag += d_pct
+        elif d_pct < 0:
+            down_mag += (-d_pct)
+            if (-d_pct) > worst_drop_pct:
+                worst_drop_pct = (-d_pct)
+
+    flow_ratio = (up_mag / down_mag) if down_mag > 0 else 999.0
+    net_pct = (recent[-1] - recent[0]) / recent[0]
+    ok = (
+        (net_pct > 0.0)
+        and (flow_ratio >= float(min_ratio))
+        and (worst_drop_pct <= float(max_single_drop_pct))
+    )
+    return ok, flow_ratio, worst_drop_pct, net_pct
+
+
+def descending_tape_ok(ticks, confirm_ticks: int) -> bool:
+    confirm_ticks = max(2, int(confirm_ticks))
+    if not ticks or len(ticks) < confirm_ticks:
+        return False
+    recent = [float(px) for _, px in ticks[-confirm_ticks:]]
+    for i in range(1, len(recent)):
+        if recent[i] >= recent[i - 1]:
+            return False
+    return True
+
+
+def strict_p_tape_exit_reason(p1, p2, p3, p4):
+    """Return an immediate exit reason when sampled prices fall continuously.
+
+    P1 is the newest sample and P4 the oldest, so a strict deterioration is
+    P1 < P2 < P3 < P4.
+    """
+    if any(value is None for value in (p1, p2, p3, p4)):
+        return None
+    try:
+        points = tuple(float(value) for value in (p1, p2, p3, p4))
+    except (TypeError, ValueError):
+        return None
+    if any(value <= 0 for value in points):
+        return None
+    if points[0] < points[1] < points[2] < points[3]:
+        return (
+            f"PSELL_DIRECT_TAPE P1={points[0]:.8f} P2={points[1]:.8f} "
+            f"P3={points[2]:.8f} P4={points[3]:.8f}"
+        )
+    return None
+
+
+def burst_entry_signal(ticks, spread: float, cfg):
+    stats = {
+        "return_pct": 0.0,
+        "elapsed_sec": 0.0,
+        "velocity_pct_per_sec": 0.0,
+        "efficiency": 0.0,
+        "pressure_ratio": 0.0,
+        "max_single_drop_pct": 0.0,
+        "required_return_pct": 0.0,
+        "roundtrip_cost_pct": 0.0,
+        "required_edge_pct": 0.0,
+        "start_px": 0.0,
+        "end_px": 0.0,
+    }
+    if not bool(getattr(cfg, "burstEntryEnabled", False)):
+        return False, stats
+
+    lookback = max(3, int(getattr(cfg, "burstLookbackTicks", 4) or 4))
+    if not ticks or len(ticks) < lookback:
+        return False, stats
+
+    recent = ticks[-lookback:]
+    t0 = float(recent[0][0])
+    t1 = float(recent[-1][0])
+    p0 = float(recent[0][1])
+    p1 = float(recent[-1][1])
+    elapsed = max(0.0, t1 - t0)
+
+    stats["elapsed_sec"] = elapsed
+    stats["start_px"] = p0
+    stats["end_px"] = p1
+
+    if p0 <= 0 or p1 <= 0:
+        return False, stats
+
+    max_window_sec = float(getattr(cfg, "burstMaxWindowSec", 0.0) or 0.0)
+    if max_window_sec > 0 and elapsed > max_window_sec:
+        return False, stats
+
+    net_ret = (p1 - p0) / p0
+    up_energy = 0.0
+    down_energy = 0.0
+    total_abs = 0.0
+    max_single_drop = 0.0
+    last = p0
+    for _, px in recent[1:]:
+        px = float(px)
+        if last <= 0:
+            last = px
+            continue
+        step_ret = (px - last) / last
+        if step_ret > 0:
+            up_energy += step_ret
+        elif step_ret < 0:
+            mag = -step_ret
+            down_energy += mag
+            if mag > max_single_drop:
+                max_single_drop = mag
+        total_abs += abs(step_ret)
+        last = px
+
+    pressure_ratio = (up_energy / down_energy) if down_energy > 0 else (999.0 if up_energy > 0 else 0.0)
+    efficiency = (net_ret / total_abs) if total_abs > 0 and net_ret > 0 else 0.0
+    velocity = (net_ret / elapsed) if elapsed > 0 else (999.0 if net_ret > 0 else 0.0)
+    min_return = float(getattr(cfg, "burstMinReturnPct", 0.0) or 0.0)
+    min_return_vs_fee_buf = float(getattr(cfg, "burstMinReturnVsFeeBuf", 0.0) or 0.0)
+    min_move_vs_spread = float(getattr(cfg, "burstMinMoveVsSpread", 0.0) or 0.0)
+    fee_buf_floor = float(getattr(cfg, "feeBufPct", 0.0) or 0.0) * min_return_vs_fee_buf
+    roundtrip_cost = compute_roundtrip_cost_pct(
+        spread,
+        float(getattr(cfg, "defaultFeeRate", 0.001) or 0.001),
+        float(getattr(cfg, "minProfitBufferPct", 0.0) or 0.0),
+    )
+    required_edge = roundtrip_cost * float(getattr(cfg, "burstMinNetEdgeMult", 1.25) or 1.25)
+    required_return = max(min_return, float(spread) * min_move_vs_spread, fee_buf_floor, required_edge)
+
+    stats["return_pct"] = net_ret
+    stats["velocity_pct_per_sec"] = velocity
+    stats["efficiency"] = efficiency
+    stats["pressure_ratio"] = pressure_ratio
+    stats["max_single_drop_pct"] = max_single_drop
+    stats["required_return_pct"] = required_return
+    stats["roundtrip_cost_pct"] = roundtrip_cost
+    stats["required_edge_pct"] = required_edge
+
+    ok = (
+        net_ret >= required_return
+        and velocity >= float(getattr(cfg, "burstMinVelocityPctPerSec", 0.0) or 0.0)
+        and efficiency >= float(getattr(cfg, "burstMinEfficiency", 0.0) or 0.0)
+        and pressure_ratio >= float(getattr(cfg, "burstMinPressureRatio", 0.0) or 0.0)
+        and max_single_drop <= float(getattr(cfg, "burstMaxSingleDropPct", 1.0) or 1.0)
+    )
+    return ok, stats
+
+
+def burst_exit_reason(pos, ticks, bid: float, spread: float, cfg, logger=None):
+    if pos is None or not bool(getattr(pos, "burstMode", False)):
+        return None
+    entry = float(getattr(pos, "entry", 0.0) or 0.0)
+    if entry <= 0 or bid <= 0:
+        return None
+
+    age_sec = max(0.0, time.time() - float(getattr(pos, "ts_entry", time.time())))
+    peak = max(float(getattr(pos, "high", bid) or bid), float(bid))
+    extension_pct = ((peak - entry) / entry) if entry > 0 else 0.0
+    drawdown_pct = ((peak - float(bid)) / peak) if peak > 0 else 0.0
+    loss_pct = max(0.0, (entry - float(bid)) / entry) if entry > 0 else 0.0
+    confirm_ticks = max(2, int(getattr(cfg, "burstExitConfirmTicks", 3) or 3))
+    descending = descending_tape_ok(ticks, confirm_ticks)
+    base_return_pct = max(0.0, float(getattr(pos, "burstBaseReturnPct", 0.0) or 0.0))
+    fail_ttl = float(getattr(cfg, "burstFailTtlSec", 0.0) or 0.0)
+    fail_loss_trigger = max(
+        float(getattr(cfg, "burstFailLossPct", 0.0) or 0.0),
+        float(spread) * float(getattr(cfg, "burstFailLossVsSpread", 0.0) or 0.0),
+    )
+
+    drawdown_trigger = max(
+        float(getattr(cfg, "burstExitMinDrawdownPct", 0.0) or 0.0),
+        base_return_pct * float(getattr(cfg, "burstExitGivebackMult", 0.0) or 0.0),
+        float(spread) * float(getattr(cfg, "burstExitDrawdownVsSpread", 0.0) or 0.0),
+    )
+    follow_min_extension = float(getattr(cfg, "burstFollowMinExtensionPct", 0.0) or 0.0)
+    reversal_peak_pct = max(
+        follow_min_extension,
+        float(getattr(cfg, "burstReversalMinPeakPct", 0.0) or 0.0),
+        base_return_pct * 0.5,
+    )
+    under_entry_pct = max(
+        float(getattr(cfg, "burstExitUnderEntryPct", 0.0) or 0.0),
+        float(getattr(cfg, "feeBufPct", 0.0) or 0.0) * 0.25,
+    )
+    under_entry = float(bid) <= (entry * (1.0 - under_entry_pct))
+
+    if (
+        fail_ttl > 0
+        and age_sec <= fail_ttl
+        and descending
+        and extension_pct < reversal_peak_pct
+        and under_entry
+        and loss_pct >= fail_loss_trigger
+    ):
+        return (
+            f"BURST_FAIL age={age_sec:.2f}s loss={loss_pct*100:.4f}% "
+            f"trigger={fail_loss_trigger*100:.4f}% ext={extension_pct*100:.4f}% "
+            f"need={reversal_peak_pct*100:.4f}% bid={bid:.8f} entry={entry:.8f}"
+        )
+
+    if (
+        extension_pct >= reversal_peak_pct
+        and descending
+        and drawdown_pct >= drawdown_trigger
+    ):
+        return (
+            f"BURST_REVERSAL age={age_sec:.2f}s drawdown={drawdown_pct*100:.4f}% "
+            f"trigger={drawdown_trigger*100:.4f}% ext={extension_pct*100:.4f}% "
+            f"peak={peak:.8f} bid={bid:.8f}"
+        )
+
+    if (
+        logger is not None
+        and fail_ttl > 0
+        and age_sec >= fail_ttl
+        and not bool(getattr(pos, "burstHandoffLogged", False))
+    ):
+        logger(
+            f"BURST_HANDOFF age={age_sec:.2f}s ext={extension_pct*100:.4f}% "
+            f"loss={loss_pct*100:.4f}% peak={peak:.8f} stop={float(getattr(pos, 'stop', 0.0) or 0.0):.8f} "
+            f"protect={int(bool(getattr(pos, 'protectArmed', False)))} "
+            f"trail={int(bool(getattr(pos, 'armed', False)))}"
+        )
+        setattr(pos, "burstHandoffLogged", True)
+    return None
+
+
+def entry_guard_exit_reason(pos, ticks, bid: float, spread: float, mom_pct: float, up_ratio: float, cfg, fee_rate: float):
+    if pos is None or bid <= 0:
+        return None
+    entry = float(getattr(pos, "entry", 0.0) or 0.0)
+    qty = float(getattr(pos, "qty", 0.0) or 0.0)
+    if entry <= 0 or qty <= 0:
+        return None
+
+    age_sec = max(0.0, time.time() - float(getattr(pos, "ts_entry", time.time())))
+    min_age = float(getattr(cfg, "entryGuardMinAgeSec", 3.0) or 0.0)
+    if age_sec < min_age:
+        return None
+
+    gross_pct = (float(bid) - entry) / entry
+    net_pct = gross_pct - (float(fee_rate) * 2.0)
+    peak = max(float(getattr(pos, "high", bid) or bid), float(bid), entry)
+    peak_gain_pct = max(0.0, (peak - entry) / entry)
+    giveback_pct = max(0.0, (peak - float(bid)) / peak) if peak > 0 else 0.0
+    descending = descending_tape_ok(ticks, 3)
+    weak_tape = descending or (float(mom_pct) <= 0.0) or (
+        float(up_ratio) < max(0.35, float(getattr(cfg, "momMinUpRatio", 0.0) or 0.0) * 0.6)
+    )
+
+    arm_gain = max(
+        float(getattr(cfg, "entryGuardArmGainPct", 0.0025) or 0.0),
+        float(fee_rate) * 2.0,
+    )
+    net_floor = float(getattr(cfg, "entryGuardNetFloorPct", 0.0002) or 0.0)
+    giveback_trigger = float(getattr(cfg, "entryGuardGivebackPct", 0.0015) or 0.0)
+
+    if (
+        peak_gain_pct >= arm_gain
+        and net_pct <= net_floor
+        and giveback_pct >= giveback_trigger
+        and weak_tape
+    ):
+        return (
+            f"ENTRY_GUARD_PROTECT age={age_sec:.1f}s net={net_pct*100:.4f}% "
+            f"gross={gross_pct*100:.4f}% peak={peak_gain_pct*100:.4f}% "
+            f"giveback={giveback_pct*100:.4f}% bid={bid:.8f} entry={entry:.8f}"
+        )
+
+    loss_cut = max(
+        float(getattr(cfg, "entryGuardLossCutPct", 0.0015) or 0.0),
+        float(fee_rate) * 0.75,
+    )
+    loss_age = max(
+        float(getattr(cfg, "entryGuardLossAgeSec", 12.0) or 0.0),
+        float(getattr(cfg, "entryFillTtlSec", 2.5) or 2.5) * 3.0,
+    )
+    if gross_pct <= -loss_cut and (weak_tape or age_sec >= loss_age):
+        return (
+            f"ENTRY_GUARD_LOSS_CUT age={age_sec:.1f}s net={net_pct*100:.4f}% "
+            f"gross={gross_pct*100:.4f}% cut={loss_cut*100:.4f}% "
+            f"bid={bid:.8f} entry={entry:.8f}"
+        )
+
+    return None
+
+
+def ticks_fresh(ticks, max_age_sec: float) -> bool:
+    if not ticks:
+        return False
+    age = time.time() - float(ticks[-1][0])
+    return age <= float(max_age_sec)
+
+
+from core.config import loadConfig, pickProfile, applyRiskConfig, resolveServiceEnvPath, validateRuntimeSafety
+from core.logging import LogDayContext, tradeLogger, tradeCsvLogger, errorLogger, ensureCsvHeader, local_timestamp
+from core.trade_memory import load_token_scores, sync_trade_memory
+from services.ipguard import vpnCheckOrDie
+
+from exchange.kraken import Kraken
+from exchange.stream import Stream
+
+from execution.orders import OrderStateUnknown, openOrders, order_fee_summary, placeLimit, waitFillOrCancel
+from state.wallet_sync import loadWalletFlatGuard, walletSyncEvery
+from state.position import Position, SESSION_HIGH_DROP_REASON
+
+from indicators.basic import fmt, computeSignals, computeMarketContext
+
+# Range V1 — optional module, disabled if not installed
+try:
+    from btc_range_v1.logic import build_range_snapshot, range_market_ok, entry_signal, update_position, RangeSnapshot
+    _RANGE_V1_AVAILABLE = True
+except ModuleNotFoundError:
+    _RANGE_V1_AVAILABLE = False
+    build_range_snapshot = range_market_ok = entry_signal = update_position = RangeSnapshot = None
+from strategy.pic_filter import check_near_peak, should_block_near_peak
+from strategy.position_dynamics import (
+    PositionDynamics, init_dynamics, update_dynamics,
+    check_trailing_stop, check_breakeven_escape,
+    check_return_to_entry_escape,
+    save_dynamics, load_dynamics, clear_dynamics,
+)
+
+
+def round_step(qty: float, step: float) -> float:
+    dqty = Decimal(str(qty))
+    dstep = Decimal(str(step))
+    return float((dqty // dstep) * dstep)
+
+
+
+def round_step_up(qty: float, step: float) -> float:
+    if step <= 0:
+        return float(qty)
+    dqty = Decimal(str(qty))
+    dstep = Decimal(str(step))
+    q = (dqty / dstep).to_integral_value(rounding=ROUND_CEILING)
+    return float(q * dstep)
+
+
+def round_tick_down(price: float, tick: float) -> float:
+    """Floor price to tick size."""
+    if tick <= 0:
+        return float(price)
+    dprice = Decimal(str(price))
+    dtick = Decimal(str(tick))
+    return float((dprice // dtick) * dtick)
+
+
+def round_tick_up(price: float, tick: float) -> float:
+    """Ceil price to tick size."""
+    if tick <= 0:
+        return float(price)
+    dprice = Decimal(str(price))
+    dtick = Decimal(str(tick))
+    q = (dprice / dtick).to_integral_value(rounding=ROUND_CEILING)
+    return float(q * dtick)
+def compute_buy_price(best_bid: float, best_ask: float, cross_spread: bool, tick: float) -> float:
+    """Return the BUY price according to the configured aggressiveness."""
+    if cross_spread:
+        return round_tick_up(best_ask, tick)
+    return round_tick_down(best_bid, tick)
+
+
+LOSS_ALLOWED_REASONS = (
+    "STOP",
+    "TRAIL",
+    "TIME_HARD",
+    "PROTECT",
+    "BURST_REVERSAL",
+    "BURST_FAIL",
+    "ENTRY_GUARD_PROTECT",
+    "ENTRY_GUARD_LOSS_CUT",
+    "PSELL FAIL",
+    "PSELL FAST",
+    SESSION_HIGH_DROP_REASON,
+)
+
+
+def loss_exit_allowed(exit_reason: str) -> bool:
+    reason = str(exit_reason or "")
+    return any(reason.startswith(prefix) for prefix in LOSS_ALLOWED_REASONS)
+
+
+def buy_below_sellable_notional(exec_qty: float, avg_buy: float, min_notional: float) -> bool:
+    try:
+        return float(exec_qty) > 0 and (float(exec_qty) * float(avg_buy)) < float(min_notional)
+    except Exception:
+        return True
+
+
+def burst_runtime_allowed(cfg) -> bool:
+    """Keep BURST diagnostic-only for strict live until CSV proves positive edge."""
+    if bool(getattr(cfg, "dryRun", False)):
+        return True
+    return str(getattr(cfg, "profileName", "") or "").strip().lower() != "strict"
+
+
+def compute_roundtrip_cost_pct(spread: float, fee_rate: float, min_profit_buffer: float) -> float:
+    return max(0.0, (2.0 * float(fee_rate)) + float(spread) + float(min_profit_buffer))
+
+
+def compute_entry_net_edge(entry_mode: str, signal_edge_pct: float, spread: float, cfg, fee_rate: float | None = None) -> dict:
+    fee = float(fee_rate if fee_rate is not None else getattr(cfg, "defaultFeeRate", 0.001) or 0.001)
+    buffer = float(getattr(cfg, "minProfitBufferPct", 0.0) or 0.0)
+    multiplier_attr = "burstMinNetEdgeMult" if str(entry_mode or "").upper() == "BURST" else "entryMinNetEdgeMult"
+    multiplier = float(getattr(cfg, multiplier_attr, 1.20) or 1.20)
+    roundtrip_cost = compute_roundtrip_cost_pct(spread, fee, buffer)
+    signal_edge = float(signal_edge_pct or 0.0)
+    required_edge = roundtrip_cost * multiplier
+    return {
+        "roundtrip_cost_pct": roundtrip_cost,
+        "signal_edge_pct": signal_edge,
+        "required_edge_pct": required_edge,
+        "expected_net_edge_pct": signal_edge - roundtrip_cost,
+        "multiplier": multiplier,
+    }
+
+
+def entry_edge_csv_fields(edge: dict | None) -> dict:
+    if not edge:
+        return {}
+    out = {}
+    for key in ("roundtrip_cost_pct", "signal_edge_pct", "required_edge_pct", "expected_net_edge_pct"):
+        value = edge.get(key)
+        out[key] = "" if value is None or value == "" else float(value) * 100.0
+    if "entry_cross_spread" in edge:
+        out["entry_cross_spread"] = int(bool(edge.get("entry_cross_spread")))
+    if "entry_mode" in edge:
+        out["entry_mode"] = edge.get("entry_mode") or ""
+    return out
+
+
+def load_blocked_symbols(path: Path) -> set[str]:
+    try:
+        if not path.exists():
+            return set()
+        blocked = set()
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            symbol = line.strip().upper()
+            if symbol:
+                blocked.add(symbol)
+        return blocked
+    except Exception:
+        return set()
+
+
+def persist_blocked_symbol(path: Path, symbol: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        blocked = load_blocked_symbols(path)
+        symbol = (symbol or "").strip().upper()
+        if not symbol or symbol in blocked:
+            return
+        with path.open("a", encoding="utf-8") as f:
+            f.write(symbol + "\n")
+    except Exception:
+        pass
+
+
+def load_toxic_symbols() -> tuple[set[str], dict[str, str]]:
+    try:
+        sync_trade_memory()
+        toxic_reasons: dict[str, str] = {}
+        for symbol, item in load_token_scores().items():
+            if bool(item.get("is_toxic")):
+                toxic_reasons[symbol] = str(item.get("toxic_reasons") or "").strip()
+        return set(toxic_reasons), toxic_reasons
+    except Exception:
+        return set(), {}
+
+
+def get_symbol_filters(bx: Kraken, symbol: str):
+    try:
+        meta = bx.resolve_pair(symbol)
+    except Exception as e:
+        raise RuntimeError(f"Invalid Kraken spot symbol: {symbol}") from e
+    return float(meta.tick), float(meta.step), float(meta.min_notional or 0.0)
+
+
+def get_account_with_retry(bx: Kraken, cfg):
+    if bool(getattr(cfg, "dryRun", False)) and (not getattr(cfg, "apiKey", "") or not getattr(cfg, "apiSecret", "")):
+        return {"balances": []}
+    max_retries = int(getattr(cfg, "walletMaxRetries", 0))
+    backoff = float(getattr(cfg, "walletRetryBackoffSec", 0.0))
+    for attempt in range(max_retries + 1):
+        try:
+            if hasattr(bx, "account_balances"):
+                return bx.account_balances()
+            return bx.get("/0/private/Balance", signed=True)
+        except Exception:
+            if attempt >= max_retries:
+                return None
+            time.sleep(backoff)
+    return None
+
+
+def get_usdc_balance_safe(bx: Kraken, cfg):
+    acc = get_account_with_retry(bx, cfg)
+    if not acc:
+        return None
+    balances = acc.get("balances", [])
+    quote_asset = str(getattr(cfg, "quoteAsset", "USDC") or "USDC").upper()
+    for b in balances:
+        if b.get("asset") == quote_asset:
+            return float(b.get("free", "0"))
+    return 0.0
+
+
+def get_asset_balance_safe(bx: Kraken, cfg, asset: str):
+    acc = get_account_with_retry(bx, cfg)
+    if not acc:
+        return None
+    balances = acc.get("balances", [])
+    for b in balances:
+        if b.get("asset") == asset:
+            return float(b.get("free", "0"))
+    return 0.0
+
+
+def _read_service_env_symbol(env_path: Path) -> str | None:
+    try:
+        if not env_path.exists():
+            return None
+        symbol = None
+        for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            k = k.strip().upper()
+            v = v.strip()
+            if k == "SYMBOL":
+                symbol = v.upper()
+                break
+        if symbol:
+            return symbol
+        return None
+    except Exception:
+        return None
+
+
+def _write_service_env_symbol(symbol: str, log_fn=None) -> None:
+    env_path = resolveServiceEnvPath()
+    if env_path is None:
+        env_path = Path(__file__).resolve().parent / ".service.env"
+    try:
+        lines = []
+        seen_symbol = False
+        if env_path.exists():
+            lines = env_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        out = []
+        for line in lines:
+            if "=" not in line or line.strip().startswith("#"):
+                out.append(line)
+                continue
+            key, _ = line.split("=", 1)
+            if key.strip().upper() == "SYMBOL":
+                out.append(f"SYMBOL={symbol}")
+                seen_symbol = True
+            else:
+                out.append(line)
+        if not seen_symbol:
+            out.append(f"SYMBOL={symbol}")
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = env_path.with_suffix(env_path.suffix + ".tmp")
+        tmp.write_text("\n".join(out) + "\n", encoding="utf-8")
+        tmp.replace(env_path)
+    except Exception as exc:
+        if log_fn is not None:
+            try:
+                log_fn(f"SERVICE_ENV_SYMBOL_WRITE_FAIL symbol={symbol} err={type(exc).__name__}:{exc}")
+            except Exception:
+                pass
+
+
+def _resolve_start_symbol() -> str | None:
+    """
+    Resolve trading symbol from argv, env, then .service.env.
+    This keeps the bot launchable even if systemd forgets to inject SYMBOL.
+    """
+    arg_symbol = sys.argv[1].strip().upper() if len(sys.argv) >= 2 else ""
+    if arg_symbol:
+        return arg_symbol
+
+    env_symbol = (os.getenv("SYMBOL") or "").strip().upper()
+    if env_symbol:
+        return env_symbol
+
+    env_path = resolveServiceEnvPath()
+    if env_path is None:
+        return None
+    return _read_service_env_symbol(env_path)
+
+
+def _maybe_reexec_on_token_change(current_symbol: str, pos, last_env_mtime: float, log_fn=None):
+    """
+    Hot-reload token only when IDLE (pos is None).
+    If .service.env SYMBOL changed -> re-exec current process with new argv.
+    """
+    env_path = resolveServiceEnvPath()
+    try:
+        if env_path is None or not env_path.exists():
+            return current_symbol, last_env_mtime
+        mtime = env_path.stat().st_mtime
+        if mtime == last_env_mtime:
+            return current_symbol, last_env_mtime
+        # only consider switching when not in position
+        if pos is not None:
+            return current_symbol, mtime
+        new_symbol = _read_service_env_symbol(env_path)
+        if not new_symbol or new_symbol == current_symbol:
+            return current_symbol, mtime
+        _reexec_to_symbol(current_symbol, new_symbol, source=".service.env", log_fn=log_fn)
+    except SystemExit:
+        raise
+    except Exception:
+        return current_symbol, last_env_mtime
+    return current_symbol, last_env_mtime
+
+
+def _reexec_to_symbol(current_symbol: str, new_symbol: str, *, source: str = ".service.env", log_fn=None):
+    msg = f"TOKEN_SWITCH old={current_symbol} new={new_symbol} source={source}"
+    print(msg)
+    if log_fn is not None:
+        try:
+            log_fn(msg)
+        except Exception:
+            pass
+    os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), new_symbol])
+
+
+def _pending_token_switch(current_symbol: str, last_env_mtime: float):
+    """
+    Read .service.env and report a requested symbol switch without re-execing yet.
+    Returns: (requested_symbol_or_none, updated_mtime)
+    """
+    env_path = resolveServiceEnvPath()
+    try:
+        if env_path is None or not env_path.exists():
+            return None, last_env_mtime
+        mtime = env_path.stat().st_mtime
+        if mtime == last_env_mtime:
+            return None, last_env_mtime
+        new_symbol = _read_service_env_symbol(env_path)
+        if not new_symbol or new_symbol == current_symbol:
+            return None, mtime
+        return new_symbol, mtime
+    except Exception:
+        return None, last_env_mtime
+
+def save_status_json(runtime_dir: Path, data: dict):
+    """Save current bot status to JSON for dashboard monitoring."""
+    try:
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        tmp = runtime_dir / "bot_status.json.tmp"
+        tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+        tmp.replace(runtime_dir / "bot_status.json")
+    except Exception:
+        pass
+
+def main():
+    symbol = _resolve_start_symbol()
+    if not symbol:
+        print("USAGE: python3 main.py BTC/USDC")
+        print("Or define SYMBOL in environment / .service.env")
+        sys.exit(1)
+    last_env_mtime = 0.0
+
+    cfg = loadConfig()
+    poll = float(getattr(cfg, 'idleSleep', getattr(cfg, 'poll', 0.2)))  # legacy alias
+    cfg = applyRiskConfig(cfg)
+    cfg = validateRuntimeSafety(cfg)
+    profile = pickProfile()
+    ipguard_enabled = os.getenv("IPGUARD", "1" if not getattr(cfg, "dryRun", False) else "0").strip().lower() in ("1", "true", "yes", "on")
+    if ipguard_enabled:
+        vpnCheckOrDie(cfg.ipFile, cfg.ipCheckTimeout)
+    else:
+        print("IPGUARD_SKIPPED dry_run=1")
+
+    bx = Kraken(
+        cfg.apiKey,
+        cfg.apiSecret,
+        cfg.baseUrl,
+        cfg.httpTimeout,
+        cfg.httpRetries,
+        cfg.httpBackoff,
+        cfg.quoteAsset,
+    )
+    try:
+        symbol = bx.normalize_symbol(symbol)
+    except Exception as exc:
+        print(f"Invalid Kraken symbol: {symbol} err={exc}")
+        sys.exit(1)
+
+    stream = Stream(cfg, symbol, mapper=bx.symbol_mapper)
+    logDayCtx = LogDayContext()
+    logTrade = tradeLogger(cfg, symbol, logDayCtx)
+    logCsv = tradeCsvLogger(cfg, symbol, logDayCtx)
+    logErr = errorLogger(cfg, symbol, logDayCtx)
+    ensureCsvHeader(cfg, symbol, logDayCtx)
+
+    try:
+
+
+        tick, step, minNotional = get_symbol_filters(bx, symbol)
+
+
+    except RuntimeError as e:
+
+
+        print(str(e))
+
+
+        sys.exit(1)
+
+    exchangeMinNotional = float(minNotional)
+    minNotional = max(
+        exchangeMinNotional,
+        float(getattr(cfg, "minOrderNotionalUsdc", 0.0) or 0.0),
+    )
+
+    cap = float(getattr(cfg, "maxUsdcPerTrade", 50.0))
+
+    # Momentum params (defaults: scalping spot)
+    momWindowSec = float(getattr(cfg, "momWindowSec", 30.0))
+    momMinPct = float(getattr(cfg, "momMinPct", 0.0005))          # 0.05%
+    momMinUpRatio = float(getattr(cfg, "momMinUpRatio", 0.55))    # 55% ticks up
+    momRangeMinPct = float(getattr(cfg, "momRangeMinPct", 0.003))
+    momRangeRelaxPct = float(getattr(cfg, "momRangeRelaxPct", 0.6))
+    momRangeRelaxUpRatio = float(getattr(cfg, "momRangeRelaxUpRatio", 0.75))
+
+    # BTC Range V1 params — disabled if module not installed
+    range_enabled = bool(getattr(cfg, "rangeEnabled", False)) and _RANGE_V1_AVAILABLE
+    range_timeframe = str(getattr(cfg, "rangeTimeframe", "5m"))
+    range_window_bars = int(getattr(cfg, "rangeWindowBars", 24))
+
+    logTrade(f"SESSION_START symbol={symbol} dry_run={int(bool(getattr(cfg,'dryRun',False)))} profile={profile.name} strategy={getattr(cfg,'strategyName','')} base_url={cfg.baseUrl}")
+
+    print(
+        f"INIT {symbol} tick={tick} step={step} "
+        f"minNotional~{minNotional}{cfg.quoteAsset} (exchange={exchangeMinNotional}) cap={cap}{cfg.quoteAsset}"
+    )
+    print(
+        f"PROFILE {profile.name} "
+        f"EMA={profile.emaFast}/{profile.emaSlow} "
+        f"RSI=[{profile.rsiMin},{profile.rsiMax}] "
+        f"VOL_MULT={profile.volMult} "
+        f"SPREAD_MAX={profile.spreadMax}"
+    )
+    print(
+        f"MOM window={momWindowSec}s minPct={momMinPct} minUpRatio={momMinUpRatio} "
+        f"rangeMinPct={momRangeMinPct} rangeRelaxPct={momRangeRelaxPct} "
+        f"rangeRelaxUpRatio={momRangeRelaxUpRatio}"
+    )
+    print(f"CFG TTL={cfg.orderTtl}s POLL={cfg.orderPoll}s")
+    if range_enabled:
+        print(
+            f"RANGE_V1 timeframe={range_timeframe} window={range_window_bars}bars "
+            f"enabled={range_enabled}"
+        )
+    print(f"CFG TTL={cfg.orderTtl}s POLL={cfg.orderPoll}s")
+    if getattr(cfg, "dryRun", False):
+        print("DRY_RUN ON (no real orders)")
+
+    pos = None
+    cooldownUntil = 0.0
+
+    syncState = {"next": 0.0}
+    syncInfo = {"usdc": 0.0}
+    pendingSwitchSymbol = None
+    pendingSwitchLogged = None
+    lastExitInfo = None
+    daily_pnl_net = 0.0
+    _last_daily_reset_date = None
+
+    # Fee model + circuit breaker
+    _fee_model = FeeModel(
+        fee_rate=float(getattr(cfg, 'defaultFeeRate', 0.001)),
+        use_bnb=bool(getattr(cfg, 'useBnbForFees', False)),
+    )
+    _circuit_breaker = CircuitBreaker(
+        daily_max_loss_usdc=float(getattr(cfg, 'dailyMaxLossUsdc', 1.0)),
+        max_consecutive_losses=int(getattr(cfg, 'maxConsecutiveLosses', 5)),
+        cooldown_after_break_sec=float(getattr(cfg, 'cooldownAfterBreakSec', 3600.0)),
+    )
+    _persisted_path = Path(getattr(cfg, 'runtimeDir', 'data/runtime')) / 'persisted_position.json'
+    _dynamics_path = Path(getattr(cfg, 'runtimeDir', 'data/runtime')) / 'position_dynamics.json'
+    _dyn: Optional[PositionDynamics] = None
+    blockedSymbols = set()
+    blocked_symbols_file = Path(getattr(cfg, "blockedSymbolsFile", Path("data/blocked_symbols.txt")))
+    blockedSymbols.update(load_blocked_symbols(blocked_symbols_file))
+    toxicSymbols, toxicReasons = load_toxic_symbols()
+    override_manual_block = bool(getattr(cfg, "tokenQuality_overrideManualSymbol", False))
+    blockedSymbols.update(toxicSymbols)
+    if toxicSymbols:
+        msg = (
+            f"TOXIC_MEMORY_LOADED count={len(toxicSymbols)} "
+            f"symbols={','.join(sorted(toxicSymbols)[:10])}"
+        )
+        print(msg)
+        logTrade(msg)
+    if override_manual_block and symbol in toxicSymbols:
+        block_reason = toxicReasons.get(symbol) or "persisted_blocked_symbol"
+        blockedSymbols.discard(symbol)
+        msg = (
+            f"SYMBOL_BLOCK_OVERRIDE symbol={symbol} profile={cfg.profileName} "
+            f"reason={block_reason}"
+        )
+        print(msg)
+        logTrade(msg)
+    if symbol in blockedSymbols:
+        # Stay alive and wait for a new symbol instead of triggering a restart loop.
+        block_reason = toxicReasons.get(symbol) or "persisted_blocked_symbol"
+        msg = (
+            f"SYMBOL_BLOCKED_PERSISTED symbol={symbol} "
+            f"file={blocked_symbols_file} action=WAIT_FOR_SWITCH reason={block_reason}"
+        )
+        print(msg)
+        logTrade(msg)
+
+    # ring buffers:
+    # - ticks uses MID for legacy P1..P4 logic
+    # - bidTicks uses BID for burst mode and fast exits
+    ticks = []
+    bidTicks = []
+
+    # NEW: Klines buffer for range analysis
+    klines_buffer = []
+    last_kline_fetch = 0.0
+    kline_refresh_sec = 30.0
+
+    stream.start()
+    lastChk = 0.0
+    lastTickSeq = -1
+
+    lastHoldCsv = 0.0
+    holdCsvEvery = float(getattr(cfg, 'holdCsvEvery', 60))
+    signalCache = {"ts": 0.0, "s1": None, "s5": None, "market": None}
+    signalRefreshSec = float(getattr(cfg, "signalRefreshSec", 15.0) or 15.0)
+
+    # NEW: Runtime dir for status JSON
+    runtime_dir = Path(getattr(cfg, "dataDir", "data")) / "runtime"
+    wallet_flat_guard = loadWalletFlatGuard(symbol)
+    if wallet_flat_guard:
+        cooldownUntil = max(
+            cooldownUntil,
+            float(wallet_flat_guard.get("until", 0.0) or 0.0),
+        )
+        logTrade(
+            f"WALLET_FLAT_GUARD_RESTORED symbol={symbol} "
+            f"reason={wallet_flat_guard.get('reason','')} "
+            f"until={cooldownUntil:.3f}"
+        )
+
+    def clear_runtime_position_state(reason: str, detail: str = ""):
+        nonlocal _dyn
+        try:
+            clear_position(_persisted_path)
+        except Exception as e:
+            try:
+                logErr("CLEAR_PERSISTED_POSITION_FAIL", e)
+            except Exception:
+                pass
+        try:
+            _pos_file = runtime_dir / "active_position.json"
+            if _pos_file.exists():
+                _pos_file.unlink()
+        except Exception as e:
+            try:
+                logErr("CLEAR_ACTIVE_POSITION_FAIL", e)
+            except Exception:
+                pass
+        try:
+            clear_dynamics(_dynamics_path)
+        except Exception as e:
+            try:
+                logErr("CLEAR_DYNAMICS_FAIL", e)
+            except Exception:
+                pass
+        _dyn = None
+        try:
+            suffix = f" {detail}" if detail else ""
+            logTrade(f"POSITION_STATE_CLEARED reason={reason}{suffix}")
+        except Exception:
+            pass
+
+    def _session_high_value(position) -> float:
+        if position is None:
+            return 0.0
+        entry = float(getattr(position, "entry", 0.0) or 0.0)
+        high = float(getattr(position, "high", entry) or entry)
+        session_high = float(getattr(position, "sessionHighPrice", 0.0) or 0.0)
+        return max(entry, high, session_high)
+
+    def persist_open_position_state(reason: str = ""):
+        if pos is None or float(getattr(pos, "entry", 0.0) or 0.0) <= 0:
+            return
+        try:
+            session_high = _session_high_value(pos)
+            _pos_file = runtime_dir / "active_position.json"
+            _pos_file.parent.mkdir(parents=True, exist_ok=True)
+            _pos_file.write_text(json.dumps({
+                "symbol": symbol,
+                "entry": float(getattr(pos, 'entry', 0.0)),
+                "entry_price": float(getattr(pos, 'entry', 0.0)),
+                "qty": float(getattr(pos, 'qty', 0.0)),
+                "ts_entry": float(getattr(pos, 'ts_entry', time.time())),
+                "session_high_price": session_high,
+                "high": session_high,
+                "reason": reason,
+            }), encoding="utf-8")
+            save_position(PersistedPosition(
+                symbol=symbol,
+                entry_price=float(getattr(pos, 'entry', 0.0)),
+                entry_qty=float(getattr(pos, 'qty', 0.0)),
+                entry_ts=float(getattr(pos, 'ts_entry', time.time())),
+                entry_reason=reason or "OPEN_POSITION",
+                high_seen=session_high,
+                buy_notional=float(getattr(pos, 'entry', 0.0)) * float(getattr(pos, 'qty', 0.0)),
+            ), _persisted_path)
+        except Exception as e:
+            try:
+                logErr("PERSIST_OPEN_POSITION_FAIL", e)
+            except Exception:
+                pass
+
+    def sync_log_day_anchor(position):
+        if position is None:
+            logDayCtx.clear_anchor()
+            return
+        logDayCtx.ensure_anchor_today()
+
+    def load_signal_snapshot(now):
+        cached_s1 = signalCache.get("s1")
+        cached_s5 = signalCache.get("s5")
+        cached_market = signalCache.get("market")
+        if (
+            cached_s1 is not None
+            and cached_s5 is not None
+            and cached_market is not None
+            and (now - float(signalCache.get("ts", 0.0))) <= signalRefreshSec
+        ):
+            return cached_s1, cached_s5, cached_market
+        try:
+            s1, s5 = computeSignals(bx, symbol, profile)
+            market = computeMarketContext(bx, symbol)
+            signalCache["ts"] = now
+            signalCache["s1"] = s1
+            signalCache["s5"] = s5
+            signalCache["market"] = market
+            return s1, s5, market
+        except Exception as e:
+            logErr("SIGNAL_FETCH_FAIL", e)
+            return None, None, None
+
+    # NEW: Fetch klines for range analysis
+    def fetch_klines_for_range():
+        nonlocal klines_buffer, last_kline_fetch
+        now = time.time()
+        if now - last_kline_fetch < kline_refresh_sec and klines_buffer:
+            return klines_buffer
+        try:
+            limit = max(range_window_bars + 10, 50)
+            klines = bx.klines(symbol, range_timeframe, limit)
+            if isinstance(klines, list) and len(klines) >= range_window_bars:
+                klines_buffer = klines
+                last_kline_fetch = now
+                return klines_buffer
+        except Exception as e:
+            logErr("KLINES_FETCH_FAIL", e)
+        return klines_buffer
+
+    def maybe_hold(
+        now,
+        reason,
+        spread,
+        momPct,
+        momRangePct,
+        upRatio,
+        bid,
+        ask,
+        mid,
+        p1,
+        p2,
+        p3,
+        p4,
+        detail="",
+        signal=None,
+        entry_edge=None,
+    ):
+        nonlocal lastHoldCsv
+        signal = signal or {}
+        if (now - lastHoldCsv) < holdCsvEvery:
+            return
+        lastHoldCsv = now
+        try:
+            row = {
+                'ts_utc': int(now),
+                'symbol': symbol,
+                'event': 'DECIDE_HOLD',
+                'side': '',
+                'qty': '',
+                'price': '',
+                'reason': reason,
+                'pnl': '',
+                'profile': profile.name,
+                'dry_run': int(getattr(cfg, 'dryRun', False)),
+                'spread_pct': float(spread)*100.0,
+                'mom_pct': float(momPct)*100.0,
+                'mom_range_pct': float(momRangePct)*100.0,
+                'up_ratio': float(upRatio)*100.0,
+                'rsi': '' if signal.get('rsi') is None else float(signal.get('rsi')),
+                'ema1_ok': '' if signal.get('ema1_ok') is None else int(bool(signal.get('ema1_ok'))),
+                'ema5_ok': '' if signal.get('ema5_ok') is None else int(bool(signal.get('ema5_ok'))),
+                'vol_ok': '' if signal.get('vol_ok') is None else int(bool(signal.get('vol_ok'))),
+                'bid': float(bid),
+                'ask': float(ask),
+                'mid': float(mid),
+                'entry_price': '',
+                'p1': '' if p1 is None else float(p1),
+                'p2': '' if p2 is None else float(p2),
+                'p3': '' if p3 is None else float(p3),
+                'p4': '' if p4 is None else float(p4),
+                'entry_vs_mid_pct': '',
+                'mid_vs_entry_pct': '',
+            }
+            row.update(entry_edge_csv_fields(entry_edge))
+            logCsv(row)
+        except Exception:
+            pass
+        try:
+            detail_suffix = f" {detail}" if detail else ""
+            logTrade(
+                f"DECIDE_HOLD reason={reason} spread={spread*100:.4f}% mom={momPct*100:.4f}% "
+                f"range={momRangePct*100:.4f}% up={upRatio*100:.2f}% "
+                f"mid={mid:.8f} P1={p1} P2={p2} P3={p3} P4={p4}{detail_suffix}"
+            )
+            print(
+                f"DECIDE_HOLD reason={reason} spread={spread*100:.4f}% mom={momPct*100:.4f}% "
+                f"range={momRangePct*100:.4f}% up={upRatio*100:.2f}% "
+                f"mid={mid:.8f} P1={p1} P2={p2} P3={p3} P4={p4}{detail_suffix}"
+            )
+        except Exception:
+            pass
+
+    def handle_wallet_sync_info(syncInfo: dict, current_bid: float):
+        nonlocal pos, _dyn, pendingSwitchSymbol, pendingSwitchLogged, last_env_mtime, cooldownUntil
+        if not isinstance(syncInfo, dict):
+            return
+        sync_reason = str(syncInfo.get("reason", ""))
+        sync_status = str(syncInfo.get("status") or syncState.get("status") or "")
+
+        if sync_status == "ENTRY_UNKNOWN":
+            cooldownUntil = max(
+                cooldownUntil,
+                float(syncState.get("next", 0.0) or 0.0),
+            )
+            pos = None
+            _dyn = None
+            try:
+                logTrade(
+                    f"ENTRY_UNKNOWN_BLOCK symbol={syncInfo.get('symbol', symbol)} "
+                    f"qty={syncInfo.get('wallet_qty', syncInfo.get('qty', ''))} "
+                    f"reason={sync_reason or syncState.get('reason', '')}"
+                )
+            except Exception:
+                pass
+            return
+
+        if sync_reason == "external_symbol_found" and pos is None:
+            external_symbol = str(syncInfo.get("external_symbol") or "").upper()
+            if external_symbol and external_symbol != symbol:
+                try:
+                    logTrade(
+                        f"WALLET_EXTERNAL_POSITION_FOUND current={symbol} "
+                        f"external={external_symbol} qty={syncInfo.get('wallet_qty','')} "
+                        f"notional={syncInfo.get('wallet_notional','')}"
+                    )
+                except Exception:
+                    pass
+                _write_service_env_symbol(external_symbol, log_fn=logTrade)
+                _reexec_to_symbol(symbol, external_symbol, source="wallet_external_position", log_fn=logTrade)
+
+        if sync_reason in ("wallet_cleared", "wallet_dust") and bool(syncInfo.get("changed")):
+            entry_block_until = float(syncInfo.get("entry_block_until", 0.0) or 0.0)
+            if entry_block_until > 0:
+                cooldownUntil = max(cooldownUntil, entry_block_until)
+            clear_runtime_position_state(
+                sync_reason,
+                (
+                    f"wallet_qty={syncInfo.get('wallet_qty','')} "
+                    f"wallet_notional={syncInfo.get('wallet_notional','')} "
+                    f"entry_block_until={entry_block_until:.3f}"
+                ),
+            )
+            pos = None
+            _dyn = None
+            return
+
+        # If Kraken wallet contains the active base asset, promote it to a
+        # first-class bot position so dashboard/exits/restarts stay aligned.
+        if pos is None or not bool(syncInfo.get("changed")):
+            return
+        if sync_reason not in ("wallet_found", "qty_mismatch"):
+            return
+        try:
+            if float(getattr(pos, "entry", 0.0) or 0.0) > 0 and float(getattr(pos, "stop", 0.0) or 0.0) <= 0:
+                pos.init_stops(cfg, profile, tick=tick)
+        except Exception:
+            pass
+        try:
+            if float(getattr(pos, "sessionHighPrice", 0.0) or 0.0) <= 0:
+                pos.sessionHighPrice = _session_high_value(pos)
+            _pos_file = runtime_dir / "active_position.json"
+            _pos_file.parent.mkdir(parents=True, exist_ok=True)
+            _pos_file.write_text(json.dumps({
+                "symbol": symbol,
+                "entry": float(getattr(pos, 'entry', 0.0)),
+                "entry_price": float(getattr(pos, 'entry', 0.0)),
+                "cost_basis": float(getattr(pos, 'cost_basis', getattr(pos, 'entry', 0.0)) or 0.0),
+                "entry_source": str(syncInfo.get('entry_source', '')),
+                "qty": float(getattr(pos, 'qty', 0.0)),
+                "ts_entry": float(getattr(pos, 'ts_entry', time.time())),
+                "session_high_price": _session_high_value(pos),
+                "high": _session_high_value(pos),
+                "source": sync_reason,
+            }), encoding="utf-8")
+            if float(getattr(pos, "entry", 0.0) or 0.0) > 0:
+                save_position(PersistedPosition(
+                    symbol=symbol,
+                    entry_price=float(getattr(pos, 'entry', 0.0)),
+                    entry_qty=float(getattr(pos, 'qty', 0.0)),
+                    entry_ts=float(getattr(pos, 'ts_entry', time.time())),
+                    entry_reason=f"WALLET_SYNC_{sync_reason}",
+                    high_seen=_session_high_value(pos),
+                    buy_notional=float(getattr(pos, 'entry', 0.0)) * float(getattr(pos, 'qty', 0.0)),
+                ), _persisted_path)
+        except Exception as e:
+            logErr("WALLET_POSITION_PERSIST_FAIL", e)
+        try:
+            if bool(getattr(cfg, "positionDynamics_enabled", True)) and float(getattr(pos, "entry", 0.0) or 0.0) > 0:
+                _dyn_existing = load_dynamics(_dynamics_path)
+                if _dyn_existing and abs(_dyn_existing.entry_price - float(getattr(pos, 'entry', 0.0))) < 0.000001:
+                    _dyn = _dyn_existing
+                else:
+                    _dyn = init_dynamics(
+                        float(getattr(pos, 'entry', 0.0)),
+                        float(getattr(pos, 'ts_entry', time.time())),
+                        current_bid,
+                    )
+                    save_dynamics(_dyn, _dynamics_path)
+        except Exception as e:
+            logErr("WALLET_DYNAMICS_INIT_FAIL", e)
+        try:
+            logTrade(
+                f"WALLET_POSITION_SYNCED symbol={symbol} qty={getattr(pos,'qty',0)} "
+                f"entry={getattr(pos,'entry',0)} stop={getattr(pos,'stop',0)} "
+                f"reason={sync_reason} entry_source={syncInfo.get('entry_source','')} "
+                f"cost_basis={syncInfo.get('cost_basis','')} notional={syncInfo.get('wallet_notional','')} "
+                f"qty_delta={syncInfo.get('qty_delta','')}"
+            )
+            logCsv({
+                "ts_utc": local_timestamp(),
+                "symbol": symbol,
+                "event": "POSITION_SYNC",
+                "side": "",
+                "qty": float(getattr(pos, "qty", 0.0) or 0.0),
+                "price": float(getattr(pos, "entry", 0.0) or 0.0),
+                "reason": sync_reason,
+                "wallet_sync_status": sync_reason,
+                "notional": syncInfo.get("wallet_notional", ""),
+            })
+        except Exception:
+            pass
+
+    def mark_order_state_unknown(side: str, order: dict, exc: Exception):
+        nonlocal cooldownUntil
+        order_id = order.get("orderId", "") if isinstance(order, dict) else ""
+        client_order_id = order.get("clientOrderId", "") if isinstance(order, dict) else ""
+        syncState["order_status"] = "ORDER_STATE_UNKNOWN"
+        syncState["order_side"] = side
+        syncState["order_id"] = order_id
+        syncState["client_order_id"] = client_order_id
+        syncState["next"] = 0.0
+        cooldownUntil = time.time() + max(float(getattr(cfg, "entryCooldownSec", 30.0)), 60.0)
+        msg = f"ORDER_STATE_UNKNOWN symbol={symbol} side={side} order_id={order_id} client_order_id={client_order_id} err={exc}"
+        print(msg)
+        try:
+            logTrade(msg)
+            logCsv({
+                "ts_utc": local_timestamp(),
+                "symbol": symbol,
+                "event": "ORDER_STATE_UNKNOWN",
+                "side": side,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "exchange_status": "UNKNOWN",
+                "error_msg": str(exc),
+            })
+        except Exception:
+            pass
+
+    def order_unknown_blocks_entry() -> bool:
+        if syncState.get("order_status") != "ORDER_STATE_UNKNOWN":
+            return False
+        try:
+            open_orders = openOrders(bx, symbol)
+        except Exception as exc:
+            try:
+                logTrade(f"ORDER_UNKNOWN_OPEN_ORDERS_CHECK_FAIL symbol={symbol} err={type(exc).__name__}:{exc}")
+            except Exception:
+                pass
+            return True
+        if isinstance(open_orders, list) and len(open_orders) == 0:
+            try:
+                logTrade(
+                    f"ORDER_UNKNOWN_CLEARED symbol={symbol} side={syncState.get('order_side','')} "
+                    f"order_id={syncState.get('order_id','')} open_orders=0"
+                )
+            except Exception:
+                pass
+            for key in ("order_status", "order_side", "order_id", "client_order_id"):
+                syncState.pop(key, None)
+            return False
+        try:
+            logTrade(
+                f"ORDER_UNKNOWN_BLOCK_ENTRY symbol={symbol} "
+                f"open_orders={len(open_orders) if isinstance(open_orders, list) else 'unknown'}"
+            )
+        except Exception:
+            pass
+        return True
+
+    while True:
+        free_usdc = 0.0
+        try:
+            now = time.time()
+            
+            bid, ask, tick_ts, tick_seq = stream.snapshot()
+            if bid <= 0 or ask <= 0:
+                time.sleep(cfg.idleSleep)
+                continue
+
+            mid = (float(bid) + float(ask)) / 2.0
+            has_new_tick = tick_seq != lastTickSeq
+            if has_new_tick:
+                lastTickSeq = tick_seq
+                ticks.append((float(tick_ts or now), float(mid)))
+                bidTicks.append((float(tick_ts or now), float(bid)))
+                # prune: keep last max(window, 40s)
+                keep_sec = max(momWindowSec, float(getattr(cfg, "ticksKeepMinSec", 40.0)))
+                cutoff = now - keep_sec
+                while ticks and ticks[0][0] < cutoff:
+                    ticks.pop(0)
+                while bidTicks and bidTicks[0][0] < cutoff:
+                    bidTicks.pop(0)
+
+            # Wallet is authoritative and must be reconciled even during cooldown.
+            pos, syncState, syncInfo = walletSyncEvery(
+                bx, symbol, pos, cfg,
+                step=step,
+                minNotional=minNotional,
+                syncState=syncState,
+                intervalSec=float(getattr(cfg, 'walletSyncSec', 5)),
+                logTrade=logTrade,
+            )
+            handle_wallet_sync_info(syncInfo, bid)
+            
+            # cooldown log so it doesn't look frozen
+            if now < cooldownUntil:
+                if pos is None:
+                    symbol, last_env_mtime = _maybe_reexec_on_token_change(symbol, pos, last_env_mtime, log_fn=logTrade)
+                if pendingSwitchSymbol and pos is None:
+                    _reexec_to_symbol(symbol, pendingSwitchSymbol, source="pending_switch", log_fn=logTrade)
+                if now - lastChk >= cfg.chkEvery:
+                    lastChk = now
+                    left = cooldownUntil - now
+                    print(f"CHK COOLDOWN:{fmt(left)}s BID:{fmt(bid)} ASK:{fmt(ask)}")
+                time.sleep(cfg.idleSleep)
+                continue
+
+            # cache quote balance from wallet sync (used for entry sizing)
+            usdc = None
+            try:
+                if isinstance(syncInfo, dict):
+                    usdc = float(syncInfo.get('usdc', 0.0))
+            except Exception:
+                usdc = None
+
+
+            # wallet placeholder guard: if entry==0, try to restore from persisted file.
+            # NEVER adopt bid as entry — unknown entry price means unknown risk.
+            if pos is not None and getattr(pos, 'entry', 0.0) == 0.0:
+                _recovered_entry = 0.0
+                _recovered_session_high = 0.0
+                try:
+                    _pos_file = runtime_dir / "active_position.json"
+                    if _pos_file.exists():
+                        _pd = json.loads(_pos_file.read_text(encoding="utf-8"))
+                        if _pd.get("symbol") == symbol and float(_pd.get("entry", 0.0)) > 0:
+                            _recovered_entry = float(_pd["entry"])
+                            _recovered_session_high = float(_pd.get("session_high_price", _pd.get("high", _recovered_entry)) or _recovered_entry)
+                            logTrade(f"ENTRY_RECOVERED symbol={symbol} entry={_recovered_entry} from_disk=true")
+                except Exception:
+                    pass
+                try:
+                    if _recovered_entry <= 0:
+                        _pp = load_position(_persisted_path)
+                        if _pp is not None and _pp.symbol == symbol and float(_pp.entry_price) > 0:
+                            _recovered_entry = float(_pp.entry_price)
+                            logTrade(f"ENTRY_RECOVERED symbol={symbol} entry={_recovered_entry} from_persisted=true")
+                except Exception:
+                    pass
+                if _recovered_entry > 0:
+                    pos.entry = _recovered_entry
+                    try:
+                        _pp_high = load_position(_persisted_path)
+                        pos.high = max(float(bid), float(getattr(_pp_high, "high_seen", 0.0) or 0.0), _recovered_entry)
+                        pos.sessionHighPrice = max(float(getattr(pos, "high", _recovered_entry)), _recovered_session_high, _recovered_entry)
+                    except Exception:
+                        pos.high = float(bid)
+                        pos.sessionHighPrice = max(float(bid), _recovered_entry)
+                    pos.stop = 0.0
+                    try:
+                        pos.init_stops(cfg, profile, tick=tick)
+                    except Exception:
+                        pass
+                else:
+                    # Entry price unknown and not recoverable — go IDLE to avoid trading with wrong risk
+                    logTrade(f"ENTRY_UNKNOWN_IDLE symbol={symbol} qty={getattr(pos,'qty',0)} bid={bid} — holding IDLE until manual intervention")
+                    pos = None
+
+            sync_log_day_anchor(pos)
+
+            
+            spread = (ask - bid) / bid if bid > 0 else 1.0
+            spreadLimit = float(getattr(profile, "spreadMax", 1.0) or 1.0)
+            momModeInstant = bool(getattr(cfg, 'momUseInstant', False))
+            if momModeInstant:
+                momOk, momPct, upRatio = instant_momentum_ok(
+                    ticks,
+                    float(momMinPct),
+                    int(getattr(cfg, 'momLookback', 5)),
+                    float(getattr(cfg, 'momMinUpRatio', 0.99)),
+                )
+                momRangePct = 0.0
+            else:
+                momOk, momPct, upRatio, momRangePct = momentum_ok(
+                    ticks,
+                    momWindowSec,
+                    momMinPct,
+                    momMinUpRatio,
+                    momRangeMinPct,
+                    momRangeRelaxPct,
+                    momRangeRelaxUpRatio,
+                    bool(getattr(cfg, 'allowWarmupEntry', False)),
+                )
+
+            burstOk, burstStats = burst_entry_signal(bidTicks, spread, cfg)
+            if not burst_runtime_allowed(cfg):
+                burstOk = False
+                burstStats["disabled_reason"] = "live_strict"
+            market_ctx = signalCache.get("market")
+            rsi_now = None
+            ema1_ok = None
+            ema5_ok = None
+            vol_ok = None
+
+            # P1..P4 (MID-based). For slow symbols like BTC, optionally sample
+            # points over time instead of taking four adjacent websocket ticks.
+            def _get_p_points(tl, count: int = 4, min_interval_sec: float = 0.0):
+                points = []
+                if not tl:
+                    return [None] * count
+                if min_interval_sec <= 0:
+                    for n_from_end in range(1, count + 1):
+                        try:
+                            points.append(float(tl[-n_from_end][1]))
+                        except Exception:
+                            points.append(None)
+                    return points
+
+                last_ts = None
+                for ts, px in reversed(tl):
+                    try:
+                        ts_f = float(ts)
+                        px_f = float(px)
+                    except Exception:
+                        continue
+                    if last_ts is None or (last_ts - ts_f) >= min_interval_sec:
+                        points.append(px_f)
+                        last_ts = ts_f
+                        if len(points) >= count:
+                            break
+                while len(points) < count:
+                    points.append(None)
+                return points
+
+            P1, P2, P3, P4 = _get_p_points(
+                ticks,
+                4,
+                float(getattr(cfg, "pSampleIntervalSec", 0.0) or 0.0),
+            )
+            B1, B2, B3, B4 = _get_p_points(
+                bidTicks,
+                4,
+                float(getattr(cfg, "pSampleIntervalSec", 0.0) or 0.0),
+            )
+            S1, S2, S3, S4 = (B1, B2, B3, B4) if all(v is not None for v in (B1, B2, B3, B4)) else (P1, P2, P3, P4)
+
+            # NEW: Range analysis for BTC Range V1
+            range_snapshot = None
+            range_plan = None
+            range_signal = None
+            range_rebound = 0.0
+            if range_enabled:
+                try:
+                    klines = fetch_klines_for_range()
+                    if klines and len(klines) >= range_window_bars:
+                        range_snapshot = build_range_snapshot(klines, cfg)
+                        range_ok, range_reason = range_market_ok(range_snapshot, cfg)
+                        if range_ok:
+                            range_signal, range_reason, range_plan, range_rebound = entry_signal(
+                                range_snapshot, bid, spread, bidTicks, cfg
+                            )
+                except Exception as e:
+                    logErr("RANGE_ANALYSIS_FAIL", e)
+
+            if now - lastChk >= cfg.chkEvery:
+                lastChk = now
+                chk_msg = (
+                    f"CHK MOM:{fmt(momPct*100, Decimal('0.01'))}% "
+                    f"RANGE:{fmt(momRangePct*100, Decimal('0.01'))}% "
+                    f"UP:{fmt(upRatio*100, Decimal('0.01'))}% "
+                    f"SPREAD:{fmt(spread*100)}% BID:{fmt(bid)} ASK:{fmt(ask)} MID:{fmt(mid)} "
+                    f"P1:{fmt(P1) if P1 is not None else 'NA'} P2:{fmt(P2) if P2 is not None else 'NA'} "
+                    f"P3:{fmt(P3) if P3 is not None else 'NA'} P4:{fmt(P4) if P4 is not None else 'NA'} "
+                    f"STATE:{'IN_POS' if pos else 'IDLE'}"
+                )
+                # NEW: Add range metrics to CHK log
+                if range_snapshot:
+                    chk_msg += (
+                        f" | RANGE_V1 low={fmt(range_snapshot.low)} high={fmt(range_snapshot.high)} "
+                        f"range_pct={fmt(range_snapshot.rangePct*100)}% "
+                        f"drift={fmt(range_snapshot.driftPct*100)}% "
+                        f"trend_ok={range_snapshot.trendOk} atr={fmt(range_snapshot.atr)}"
+                    )
+                print(chk_msg)
+                logTrade(chk_msg)
+
+                # NEW: Save status JSON for dashboard
+                status_data = {
+                    "ts": now,
+                    "symbol": symbol,
+                    "bid": bid,
+                    "ask": ask,
+                    "spread_pct": spread * 100,
+                    "state": "IN_POS" if pos else "IDLE",
+                    "mom_pct": momPct * 100,
+                    "mom_range_pct": momRangePct * 100,
+                    "up_ratio": upRatio * 100,
+                }
+                if range_snapshot:
+                    status_data["snapshot"] = {
+                        "low": range_snapshot.low,
+                        "high": range_snapshot.high,
+                        "mid": range_snapshot.mid,
+                        "rangePct": range_snapshot.rangePct,
+                        "driftPct": range_snapshot.driftPct,
+                        "trendOk": range_snapshot.trendOk,
+                        "atr": range_snapshot.atr,
+                    }
+                if pos:
+                    status_data["position"] = {
+                        "qty": getattr(pos, 'qty', 0),
+                        "entry": getattr(pos, 'entry', 0),
+                        "stop": getattr(pos, 'stop', 0),
+                        "target": getattr(pos, 'target', 0),
+                        "protectArmed": getattr(pos, 'protectArmed', False),
+                    }
+                if range_plan:
+                    status_data["range_plan"] = {
+                        "entryZone": range_plan.entryZone,
+                        "targetPrice": range_plan.targetPrice,
+                        "stopPrice": range_plan.stopPrice,
+                        "rewardRisk": range_plan.rewardRisk,
+                    }
+                save_status_json(runtime_dir, status_data)
+            
+            # Management rule: never consult .service.env while a position is open.
+            # Token changes are only read/applied when fully idle.
+            if pos is None:
+                # Re-exec first, otherwise reading the pending switch would consume
+                # the new mtime and block the actual symbol change.
+                symbol, last_env_mtime = _maybe_reexec_on_token_change(symbol, pos, last_env_mtime, log_fn=logTrade)
+                requested_symbol, observed_env_mtime = _pending_token_switch(symbol, last_env_mtime)
+                if requested_symbol:
+                    pendingSwitchSymbol = requested_symbol
+                    last_env_mtime = observed_env_mtime
+                if pendingSwitchSymbol == symbol:
+                    pendingSwitchSymbol = None
+                    pendingSwitchLogged = None
+
+                if pendingSwitchSymbol and pendingSwitchLogged != pendingSwitchSymbol:
+                    msg = f"TOKEN_SWITCH_PENDING old={symbol} new={pendingSwitchSymbol} state=IDLE"
+                    print(msg)
+                    logTrade(msg)
+                    pendingSwitchLogged = pendingSwitchSymbol
+            else:
+                pendingSwitchSymbol = None
+                pendingSwitchLogged = None
+
+            # Daily PnL reset at UTC midnight
+            import datetime as _dt
+            _today = _dt.datetime.now(_dt.timezone.utc).date()
+            if _last_daily_reset_date != _today:
+                daily_pnl_net = 0.0
+                _last_daily_reset_date = _today
+
+            # Circuit breaker check (daily loss + consecutive losses)
+            _cb_blocked, _cb_reason = _circuit_breaker.should_block_entries()
+            if _cb_blocked and pos is None:
+                maybe_hold(
+                    now, 'HOLD_CIRCUIT_BREAKER',
+                    spread, momPct, momRangePct, upRatio,
+                    bid, ask, mid, P1, P2, P3, P4,
+                    detail=_cb_reason,
+                )
+                time.sleep(cfg.idleSleep)
+                continue
+
+            if pos is None and order_unknown_blocks_entry():
+                maybe_hold(
+                    now,
+                    "HOLD_ORDER_STATE_UNKNOWN",
+                    spread,
+                    momPct,
+                    momRangePct,
+                    upRatio,
+                    bid,
+                    ask,
+                    mid,
+                    P1,
+                    P2,
+                    P3,
+                    P4,
+                    detail=f"order_id={syncState.get('order_id','')} side={syncState.get('order_side','')}",
+                )
+                time.sleep(cfg.idleSleep)
+                continue
+
+            # ===== ENTRY =====
+            buySignal = False
+            entryMode = ""
+            pEntryEnabled = bool(getattr(cfg, "pEntryEnabled", True))
+            if pos is None and not pendingSwitchSymbol and has_new_tick:
+                # NEW: BTC Range V1 entry signal
+                if range_enabled and range_signal:
+                    buySignal = True
+                    entryMode = "RANGE_V1"
+                elif burstOk:
+                    buySignal = True
+                    entryMode = "BURST"
+                elif pEntryEnabled and (
+                    (P1 is not None)
+                    and (P2 is not None)
+                    and (P3 is not None)
+                    and (P4 is not None)
+                ):
+                    # Require a rising tape with actual progress, not just flat equal ticks.
+                    buySignal = (P1 >= P2) and (P2 >= P3) and (P3 >= P4) and (P1 > P4)
+                    if buySignal:
+                        entryMode = "P"
+
+            if buySignal:
+                burstOverride = entryMode == "BURST"
+                rangeOverride = entryMode == "RANGE_V1"
+
+                # Pic filter — block entry if bid is too close to recent peak
+                if bool(getattr(cfg, "picFilter_enabled", False)):
+                    _pic = check_near_peak(
+                        bidTicks, bid,
+                        lookback_seconds=int(getattr(cfg, "picFilter_lookbackSec", 180)),
+                        peak_threshold_pct=float(getattr(cfg, "picFilter_thresholdPct", 0.001)),
+                    )
+                    if should_block_near_peak(entryMode, _pic):
+                        maybe_hold(
+                            now,
+                            f"NEAR_PEAK dist={_pic.distance_from_peak_pct*100:.3f}%"
+                            f" peak={_pic.peak_price} lookback={_pic.peak_lookback_s}s",
+                            spread, momPct, momRangePct, upRatio,
+                            bid, ask, mid, P1, P2, P3, P4,
+                        )
+                        continue
+                if symbol in blockedSymbols:
+                    maybe_hold(
+                        now,
+                        'HOLD_BLOCKED_SYMBOL',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                max_mom_pct = float(getattr(cfg, "momMaxPct", 1.0) or 1.0)
+                min_range_entry_pct = float(getattr(cfg, "minRangeEntryPct", 0.0) or 0.0)
+                min_range_vs_spread = float(getattr(cfg, "minRangeVsSpread", 0.0) or 0.0)
+                required_range_pct = max(min_range_entry_pct, float(spread) * min_range_vs_spread)
+                has_p_window = all(v is not None for v in (P1, P2, P3, P4))
+                strict_up_moves = (int(P1 > P2) + int(P2 > P3) + int(P3 > P4)) if has_p_window else 0
+                entry_min_strict_ups = max(1, int(getattr(cfg, "entryMinStrictUps", 1) or 1))
+                hard_min_up_ratio = float(getattr(cfg, "entryHardMinUpRatio", 0.0) or 0.0)
+                tape_progress_pct = ((float(P1) - float(P4)) / float(P4)) if (has_p_window and float(P4) > 0) else 0.0
+                min_tape_progress_pct = float(getattr(cfg, "entryMinTapeProgressPct", 0.0) or 0.0)
+                min_tape_progress_vs_spread = float(getattr(cfg, "entryMinTapeProgressVsSpread", 0.0) or 0.0)
+                min_profit_buffer_pct = float(getattr(cfg, "minProfitBufferPct", 0.0) or 0.0)
+                entry_fee_edge_mult = float(getattr(cfg, "entryFeeEdgeMult", 1.0) or 0.0)
+                fee_edge_pct = (
+                    (float(_fee_model.fee_rate) * 2.0)
+                    + float(spread)
+                    + min_profit_buffer_pct
+                ) * entry_fee_edge_mult
+                required_tape_progress_pct = max(
+                    min_tape_progress_pct,
+                    float(spread) * min_tape_progress_vs_spread,
+                )
+
+                if burstOverride and bool(getattr(cfg, "burstRequireTape", False)):
+                    if not has_p_window:
+                        maybe_hold(
+                            now,
+                            'HOLD_BURST_TAPE',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail="waiting_for_p_window",
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    if strict_up_moves < entry_min_strict_ups:
+                        maybe_hold(
+                            now,
+                            'HOLD_BURST_TAPE',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail=f"strict_ups={strict_up_moves} need={entry_min_strict_ups}",
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    if required_tape_progress_pct > 0 and tape_progress_pct < required_tape_progress_pct:
+                        maybe_hold(
+                            now,
+                            'HOLD_BURST_TAPE',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail=(
+                                f"tape_progress={tape_progress_pct*100:.4f}% "
+                                f"required={required_tape_progress_pct*100:.4f}%"
+                            ),
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    if hard_min_up_ratio > 0 and upRatio < hard_min_up_ratio:
+                        maybe_hold(
+                            now,
+                            'HOLD_BURST_TAPE',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail=f"up_ratio={upRatio*100:.2f}% need={hard_min_up_ratio*100:.2f}%",
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+
+                if burstOverride:
+                    burst_spread_limit = float(spreadLimit) * float(getattr(cfg, "burstSpreadMaxMult", 1.0) or 1.0)
+                    if burst_spread_limit > 0 and spread > burst_spread_limit:
+                        maybe_hold(
+                            now,
+                            'HOLD_BURST_SPREAD',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail=f"spread_limit={burst_spread_limit*100:.4f}%",
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    s1, s5_burst, market_ctx = load_signal_snapshot(now)
+                    if s1 is None:
+                        maybe_hold(
+                            now,
+                            'HOLD_SIGNAL',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    rsi_now = float(getattr(s1, "rsi", 0.0))
+                    ema1_ok = bool(getattr(s1, "ema_ok", False))
+                    ema5_ok_burst = bool(getattr(s5_burst, "ema_ok", False)) if s5_burst is not None else False
+                    vol_ok = bool(getattr(s1, "vol_ok", False))
+                    if bool(getattr(cfg, "burstEmaFilter_enabled", True)) and not ema1_ok:
+                        maybe_hold(
+                            now,
+                            'HOLD_BURST_EMA',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail="ema1=0",
+                            signal={
+                                "rsi": rsi_now,
+                                "ema1_ok": ema1_ok,
+                                "ema5_ok": ema5_ok_burst,
+                                "vol_ok": vol_ok,
+                            },
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    if bool(getattr(cfg, "burstEmaFilter_enabled", True)) and not ema5_ok_burst:
+                        maybe_hold(
+                            now,
+                            'HOLD_BURST_EMA',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail="ema5=0",
+                            signal={
+                                "rsi": rsi_now,
+                                "ema1_ok": ema1_ok,
+                                "ema5_ok": ema5_ok_burst,
+                                "vol_ok": vol_ok,
+                            },
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    burst_msg = (
+                        f"BURST_TRIGGER ret={burstStats['return_pct']*100:.4f}% "
+                        f"need={burstStats['required_return_pct']*100:.4f}% "
+                        f"vel={burstStats['velocity_pct_per_sec']*100:.4f}%/s "
+                        f"eff={burstStats['efficiency']:.3f} "
+                        f"pressure={burstStats['pressure_ratio']:.2f} "
+                        f"drop={burstStats['max_single_drop_pct']*100:.4f}% "
+                        f"dt={burstStats['elapsed_sec']:.3f}s"
+                    )
+                    print(burst_msg)
+                    logTrade(burst_msg)
+
+                # NEW: Range V1 validation
+                if rangeOverride and range_plan:
+                    if not range_signal:
+                        maybe_hold(
+                            now,
+                            'HOLD_RANGE_V1',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail=f"range_reason={range_reason}",
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    range_msg = (
+                        f"RANGE_V1_TRIGGER low={range_snapshot.low:.2f} high={range_snapshot.high:.2f} "
+                        f"entry_zone={range_plan.entryZone:.2f} target={range_plan.targetPrice:.2f} "
+                        f"stop={range_plan.stopPrice:.2f} rr={range_plan.rewardRisk:.2f} "
+                        f"rebound={range_rebound*100:.4f}%"
+                    )
+                    print(range_msg)
+                    logTrade(range_msg)
+
+                if (not burstOverride and not rangeOverride) and (not momOk):
+                    maybe_hold(
+                        now,
+                        'HOLD_MOM',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                if (not burstOverride and not rangeOverride) and strict_up_moves < entry_min_strict_ups:
+                    maybe_hold(
+                        now,
+                        'HOLD_TAPE',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=f"strict_ups={strict_up_moves} need={entry_min_strict_ups}",
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                if (not burstOverride and not rangeOverride) and required_tape_progress_pct > 0 and tape_progress_pct < required_tape_progress_pct:
+                    maybe_hold(
+                        now,
+                        'HOLD_TAPE',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=(
+                            f"tape_progress={tape_progress_pct*100:.4f}% "
+                            f"required={required_tape_progress_pct*100:.4f}%"
+                        ),
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                if (not burstOverride and not rangeOverride) and hard_min_up_ratio > 0 and upRatio < hard_min_up_ratio:
+                    maybe_hold(
+                        now,
+                        'HOLD_UPRATIO',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=f"hard_min_up_ratio={hard_min_up_ratio*100:.2f}%",
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                if (not burstOverride and not rangeOverride) and fee_edge_pct > 0 and tape_progress_pct < fee_edge_pct:
+                    maybe_hold(
+                        now,
+                        'HOLD_EDGE',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=(
+                            f"tape_progress={tape_progress_pct*100:.4f}% "
+                            f"fee_edge={fee_edge_pct*100:.4f}% "
+                            f"fees={(float(_fee_model.fee_rate) * 2.0)*100:.4f}% "
+                            f"spread={float(spread)*100:.4f}% "
+                            f"buffer={min_profit_buffer_pct*100:.4f}%"
+                        ),
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                if (not burstOverride and not rangeOverride) and bool(getattr(cfg, "tickEntryEnabled", False)):
+                    tick_ok, tick_prog = tick_confirmation_ok(
+                        ticks,
+                        int(getattr(cfg, "tickEntryLookback", 3)),
+                        float(getattr(cfg, "tickEntryMinPct", 0.0004)),
+                    )
+                    if not tick_ok:
+                        maybe_hold(
+                            now,
+                            'HOLD_TICK',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail=f"tick_prog={tick_prog*100:.4f}%",
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+
+                if (not burstOverride and not rangeOverride) and bool(getattr(cfg, "flowDefenseEnabled", False)):
+                    flow_ok, flow_ratio, worst_drop_pct, flow_net_pct = flow_pressure_ok(
+                        ticks,
+                        int(getattr(cfg, "flowLookback", 8)),
+                        float(getattr(cfg, "flowMinRatio", 1.2)),
+                        float(getattr(cfg, "flowMaxSingleDropPct", 0.0025)),
+                    )
+                    if not flow_ok:
+                        maybe_hold(
+                            now,
+                            'HOLD_FLOW',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail=(
+                                f"flow_ratio={flow_ratio:.2f} "
+                                f"worst_drop={worst_drop_pct*100:.4f}% "
+                                f"net={flow_net_pct*100:.4f}%"
+                            ),
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+
+                # Burst entries also respect the loss cooldown (previously bypassed)
+                if burstOverride and lastExitInfo and lastExitInfo.get("symbol") == symbol:
+                    _b_pnl = float(lastExitInfo.get("pnl", 0.0) or 0.0)
+                    _b_exit_ts = float(lastExitInfo.get("ts", 0.0) or 0.0)
+                    _b_age = max(0.0, now - _b_exit_ts)
+                    if _b_pnl <= 0.0:
+                        _b_loss_cd = float(getattr(cfg, "reentryLossCooldownSec", 0.0) or 0.0)
+                        if _b_loss_cd > 0 and _b_age < _b_loss_cd:
+                            maybe_hold(
+                                now,
+                                'HOLD_REENTRY',
+                                spread,
+                                momPct,
+                                momRangePct,
+                                upRatio,
+                                bid,
+                                ask,
+                                mid,
+                                P1,
+                                P2,
+                                P3,
+                                P4,
+                                detail=f"burst_cd last={lastExitInfo.get('reason','')[:20]} age={_b_age:.1f}s cd={_b_loss_cd:.0f}s",
+                            )
+                            time.sleep(cfg.idleSleep)
+                            continue
+
+                if (not burstOverride and not rangeOverride) and lastExitInfo and lastExitInfo.get("symbol") == symbol:
+                    last_reason = str(lastExitInfo.get("reason") or "")
+                    last_pnl = float(lastExitInfo.get("pnl", 0.0) or 0.0)
+                    last_exit_ts = float(lastExitInfo.get("ts", 0.0) or 0.0)
+                    age_since_exit = max(0.0, now - last_exit_ts)
+
+                    if last_pnl <= 0.0:
+                        loss_cd = float(getattr(cfg, "reentryLossCooldownSec", 0.0) or 0.0)
+                        if age_since_exit < loss_cd:
+                            maybe_hold(
+                                now,
+                                'HOLD_REENTRY',
+                                spread,
+                                momPct,
+                                momRangePct,
+                                upRatio,
+                                bid,
+                                ask,
+                                mid,
+                                P1,
+                                P2,
+                                P3,
+                                P4,
+                                detail=f"last_reason={last_reason} age={age_since_exit:.1f}s cooldown={loss_cd:.1f}s",
+                            )
+                            time.sleep(cfg.idleSleep)
+                            continue
+
+                        reclaim_ref = max(
+                            float(lastExitInfo.get("entry", 0.0) or 0.0),
+                            float(lastExitInfo.get("exit", 0.0) or 0.0),
+                        )
+                        reclaim_pct = float(getattr(cfg, "reentryRecoveryPct", 0.0) or 0.0)
+                        reclaim_need = reclaim_ref * (1.0 + reclaim_pct) if reclaim_ref > 0 else 0.0
+                        reclaim_max_age = float(
+                            getattr(cfg, "reentryRecoveryMaxAgeSec", 0.0) or 0.0
+                        )
+                        reclaim_active = reclaim_max_age <= 0 or age_since_exit <= reclaim_max_age
+                        if reclaim_active and reclaim_need > 0 and mid < reclaim_need:
+                            maybe_hold(
+                                now,
+                                'HOLD_RECLAIM',
+                                spread,
+                                momPct,
+                                momRangePct,
+                                upRatio,
+                                bid,
+                                ask,
+                                mid,
+                                P1,
+                                P2,
+                                P3,
+                                P4,
+                                detail=f"last_reason={last_reason} mid={mid:.8f} reclaim_need={reclaim_need:.8f}",
+                            )
+                            time.sleep(cfg.idleSleep)
+                            continue
+                    elif last_reason == "TRAIL":
+                        trail_cd = float(getattr(cfg, "reentryTrailCooldownSec", 0.0) or 0.0)
+                        if age_since_exit < trail_cd:
+                            maybe_hold(
+                                now,
+                                'HOLD_REENTRY',
+                                spread,
+                                momPct,
+                                momRangePct,
+                                upRatio,
+                                bid,
+                                ask,
+                                mid,
+                                P1,
+                                P2,
+                                P3,
+                                P4,
+                                detail=f"last_reason={last_reason} age={age_since_exit:.1f}s cooldown={trail_cd:.1f}s",
+                            )
+                            time.sleep(cfg.idleSleep)
+                            continue
+
+                if (not burstOverride and not rangeOverride) and max_mom_pct > 0 and momPct > max_mom_pct:
+                    maybe_hold(
+                        now,
+                        'HOLD_CHASE',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                if (not burstOverride and not rangeOverride) and required_range_pct > 0 and momRangePct < required_range_pct:
+                    maybe_hold(
+                        now,
+                        'HOLD_RANGE',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=f"required_range={required_range_pct*100:.4f}%",
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                if (not burstOverride and not rangeOverride) and spread > spreadLimit:
+                    maybe_hold(
+                        now,
+                        'HOLD_SPREAD',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=f"spread_limit={spreadLimit*100:.4f}%",
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                if not burstOverride and not rangeOverride:
+                    s1, s5, market_ctx = load_signal_snapshot(now)
+                    if s1 is None or s5 is None or market_ctx is None:
+                        maybe_hold(
+                            now,
+                            'HOLD_SIGNAL',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+
+                    rsi_now = float(getattr(s1, "rsi", 0.0))
+                    ema1_ok = bool(getattr(s1, "ema_ok", False))
+                    ema5_ok = bool(getattr(s5, "ema_ok", False))
+                    vol_ok = bool(getattr(s1, "vol_ok", False))
+                    signal_state = {
+                        "rsi": rsi_now,
+                        "ema1_ok": ema1_ok,
+                        "ema5_ok": ema5_ok,
+                        "vol_ok": vol_ok,
+                    }
+
+                    strong_trend_resume = (
+                        ema1_ok
+                        and momPct >= max(float(getattr(cfg, "momMinPct", 0.0) or 0.0) * 1.25, 0.0005)
+                        and momRangePct >= max(required_range_pct * 1.15, 0.0008)
+                        and upRatio >= max(float(getattr(cfg, "momMinUpRatio", 0.0) or 0.0), 0.45)
+                    )
+                    if bool(getattr(cfg, "entryEmaFilter_enabled", True)) and (
+                        not ema1_ok or (not ema5_ok and not strong_trend_resume)
+                    ):
+                        maybe_hold(
+                            now,
+                            'HOLD_EMA',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail=(
+                                f"ema1={int(ema1_ok)} ema5={int(ema5_ok)} "
+                                f"resume={int(strong_trend_resume)}"
+                            ),
+                            signal=signal_state,
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+
+                    rsi_min = float(getattr(profile, "rsiMin", 0.0) or 0.0)
+                    rsi_max = min(
+                        float(getattr(profile, "rsiMax", 100.0) or 100.0),
+                        float(getattr(cfg, "rsiBuyMax", 100.0) or 100.0),
+                    )
+                    if not (rsi_min <= rsi_now <= rsi_max):
+                        maybe_hold(
+                            now,
+                            'HOLD_RSI',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            detail=f"rsi={rsi_now:.2f} range=[{rsi_min:.2f},{rsi_max:.2f}]",
+                            signal=signal_state,
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+
+                    if not vol_ok:
+                        maybe_hold(
+                            now,
+                            'HOLD_VOL',
+                            spread,
+                            momPct,
+                            momRangePct,
+                            upRatio,
+                            bid,
+                            ask,
+                            mid,
+                            P1,
+                            P2,
+                            P3,
+                            P4,
+                            signal=signal_state,
+                        )
+                        time.sleep(cfg.idleSleep)
+                        continue
+
+                # Refresh quote balance right before entry checks so a stale cached
+                # wallet snapshot cannot incorrectly block a valid trade.
+                live_usdc = get_usdc_balance_safe(bx, cfg)
+                if live_usdc is not None:
+                    usdc = live_usdc
+
+                if usdc is None:
+                    maybe_hold(
+                        now,
+                        'HOLD_BAL',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                if usdc < float(minNotional):
+                    maybe_hold(
+                        now,
+                        'HOLD_MIN_NOTIONAL',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=f"usdc={usdc:.8f} min_notional={float(minNotional):.8f}",
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                fee_buf = float(getattr(cfg, "feeBufPct", 0.0) or 0.0)
+                buy_safety_buf = max(fee_buf, 0.0025)
+                reserve_target = float(usdc) * buy_safety_buf
+                reserve_cap = max(0.0, float(usdc) - float(minNotional))
+                quote_reserve = min(reserve_target, reserve_cap)
+                spendable_usdc = max(0.0, float(usdc) - quote_reserve)
+                spend = min(cap, spendable_usdc)
+
+                if spend < float(minNotional):
+                    maybe_hold(
+                        now,
+                        'HOLD_MIN_NOTIONAL',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=(
+                            f"spend={spend:.8f} reserve={quote_reserve:.8f} "
+                            f"min_notional={float(minNotional):.8f}"
+                        ),
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                auto_cross_spread_pct = float(getattr(cfg, "entryAutoCrossSpreadPct", 0.0) or 0.0)
+                cross_spread = bool(getattr(cfg, "entryCrossSpread", False))
+                if burstOverride and bool(getattr(cfg, "burstForceCrossSpread", True)):
+                    cross_spread = True
+                if (not cross_spread) and auto_cross_spread_pct > 0 and float(spread) <= auto_cross_spread_pct:
+                    cross_spread = True
+
+                if burstOverride:
+                    entry_signal_edge_pct = float(burstStats.get("return_pct", 0.0) or 0.0)
+                elif rangeOverride:
+                    entry_signal_edge_pct = max(float(range_rebound or 0.0), float(tape_progress_pct or 0.0))
+                else:
+                    entry_signal_edge_pct = float(tape_progress_pct or 0.0)
+                entry_edge = compute_entry_net_edge(
+                    entryMode,
+                    entry_signal_edge_pct,
+                    float(spread),
+                    cfg,
+                    fee_rate=float(_fee_model.fee_rate),
+                )
+                entry_edge["entry_mode"] = entryMode
+                entry_edge["entry_cross_spread"] = int(bool(cross_spread))
+                if entry_edge["signal_edge_pct"] < entry_edge["required_edge_pct"]:
+                    maybe_hold(
+                        now,
+                        "HOLD_NET_EDGE",
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=(
+                            f"mode={entryMode} signal_edge={entry_edge['signal_edge_pct']*100:.4f}% "
+                            f"required={entry_edge['required_edge_pct']*100:.4f}% "
+                            f"roundtrip_cost={entry_edge['roundtrip_cost_pct']*100:.4f}% "
+                            f"expected_net={entry_edge['expected_net_edge_pct']*100:.4f}% "
+                            f"cross={int(bool(cross_spread))}"
+                        ),
+                        entry_edge=entry_edge,
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                buyPx = compute_buy_price(
+                    float(bid),
+                    float(ask),
+                    cross_spread,
+                    tick,
+                )
+                max_quote_budget = min(float(cap), float(usdc))
+                qty = round_step(spend / buyPx, step)
+                notional = qty * buyPx
+                min_qty = 0.0
+                required_quote = 0.0
+                if qty > 0 and notional < float(minNotional):
+                    min_qty = round_step_up(float(minNotional) / buyPx, step)
+                    required_quote = min_qty * buyPx
+                    if min_qty > 0 and required_quote <= (max_quote_budget + 1e-9):
+                        qty = min_qty
+                        notional = required_quote
+
+                if qty <= 0 or notional < float(minNotional):
+                    missing_quote = max(0.0, required_quote - max_quote_budget) if required_quote > 0 else 0.0
+                    maybe_hold(
+                        now,
+                        'HOLD_QTY',
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=(
+                            f"qty={qty:.8f} notional={notional:.8f} "
+                            f"buy_px={buyPx:.8f} min_notional={float(minNotional):.8f} "
+                            f"budget={max_quote_budget:.8f} "
+                            f"required_qty={min_qty:.8f} required_quote={required_quote:.8f} "
+                            f"missing_quote={missing_quote:.8f}"
+                        ),
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                try:
+                    order = placeLimit(
+                        bx, symbol, 'BUY',
+                        qty, buyPx,
+                        stepQ=step, tickQ=tick,
+                        dryRun=getattr(cfg, 'dryRun', False)
+                    )
+                except Exception as e:
+                    msg = str(e)
+                    if "not permitted for this account" in msg.lower():
+                        blockedSymbols.add(symbol)
+                        persist_blocked_symbol(blocked_symbols_file, symbol)
+                        try:
+                            logTrade(f"BLOCK_SYMBOL symbol={symbol} reason=ACCOUNT_PERMISSION")
+                            print("BLOCK_SYMBOL", symbol, "ACCOUNT_PERMISSION")
+                        except Exception:
+                            pass
+                        cooldownUntil = time.time() + max(float(getattr(cfg, 'entryCooldownSec', 30.0)), 60.0)
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    raise
+
+                _order_t0 = time.time()
+                try:
+                    filled, info = waitFillOrCancel(
+                        bx, symbol, order["orderId"],
+                        float(getattr(cfg, 'entryFillTtlSec', cfg.orderTtl)), cfg.orderPoll,
+                        dryRun=getattr(cfg, "dryRun", False),
+                        side="BUY",
+                        qty=qty,
+                        price=buyPx,
+                        maxRestRetries=int(getattr(cfg, "orderRestMaxRetries", 3)),
+                        restBackoffSec=float(getattr(cfg, "orderRestBackoffSec", 0.2)),
+                    )
+                except OrderStateUnknown as e:
+                    mark_order_state_unknown("BUY", order, e)
+                    time.sleep(cfg.idleSleep)
+                    continue
+                _fill_latency_ms = int((time.time() - _order_t0) * 1000)
+                _buy_fee = order_fee_summary(info, fallback_qty=qty, fallback_quote=qty * buyPx)
+                logCsv({
+                    "ts_utc": local_timestamp(),
+                    "symbol": symbol,
+                    "event": "ORDER_FINAL",
+                    "side": "BUY",
+                    "qty": _buy_fee["executed_qty"],
+                    "price": buyPx,
+                    "notional": _buy_fee["quote_qty"],
+                    "order_id": info.get("orderId", order.get("orderId", "")),
+                    "client_order_id": info.get("clientOrderId", order.get("clientOrderId", "")),
+                    "exchange_status": info.get("status", ""),
+                    "fill_latency_ms": _fill_latency_ms,
+                    "fee_source": _buy_fee["fee_source"],
+                    "fee_buy": _buy_fee["fee"],
+                    "commission_asset": _buy_fee["commission_asset"],
+                    "executed_qty": _buy_fee["executed_qty"],
+                    "quote_qty": _buy_fee["quote_qty"],
+                    **entry_edge_csv_fields(entry_edge),
+                })
+                if not filled:
+                    print('BUY_NOFILL')
+                    logTrade('ENTRY_TIMEOUT_CANCEL')
+                    cooldownUntil = time.time() + float(getattr(cfg, 'entryCooldownSec', 30.0))
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+                execQty = float(info.get("executedQty", qty))
+                quoteQty = float(info.get("cummulativeQuoteQty", execQty * buyPx))
+                entryPx = quoteQty / execQty if execQty > 0 else buyPx
+
+                min_filled_notional = max(
+                    float(minNotional),
+                    float(getattr(cfg, "minFilledNotionalUsdc", 6.0) or 0.0),
+                )
+                if (
+                    bool(getattr(cfg, "topupAfterPartialBuy", True))
+                    and execQty > 0
+                    and quoteQty < min_filled_notional
+                    and not bool(getattr(cfg, "dryRun", False))
+                ):
+                    topup_order_unknown = False
+                    topup_attempts = max(1, int(getattr(cfg, "topupMaxAttempts", 2) or 1))
+                    for topupAttempt in range(1, topup_attempts + 1):
+                        if quoteQty >= min_filled_notional:
+                            break
+                        topup_usdc = get_usdc_balance_safe(bx, cfg)
+                        if topup_usdc is None:
+                            topup_usdc = 0.0
+                        topupPx = compute_buy_price(float(bid), float(ask), True, tick)
+                        missing_notional = max(0.0, min_filled_notional - quoteQty)
+                        # Kraken applies MIN_NOTIONAL to the top-up order itself.
+                        topup_notional_target = max(float(minNotional), missing_notional)
+                        topupQty = round_step_up(topup_notional_target / topupPx, step)
+                        topupNotional = topupQty * topupPx
+                        if topupQty <= 0 or topupNotional > (float(topup_usdc) + 1e-9):
+                            logTrade(
+                                f"BUY_TOPUP_SKIPPED attempt={topupAttempt} current_notional={quoteQty:.8f} "
+                                f"target={min_filled_notional:.8f} topup_notional={topupNotional:.8f} "
+                                f"usdc={float(topup_usdc):.8f}"
+                            )
+                            break
+                        logTrade(
+                            f"BUY_TOPUP_START attempt={topupAttempt} current_notional={quoteQty:.8f} "
+                            f"target={min_filled_notional:.8f} topup_qty={topupQty:.8f} "
+                            f"topup_notional={topupNotional:.8f} px={topupPx:.8f}"
+                        )
+                        try:
+                            topupOrder = placeLimit(
+                                bx, symbol, "BUY",
+                                topupQty, topupPx,
+                                stepQ=step, tickQ=tick,
+                                dryRun=getattr(cfg, "dryRun", False),
+                            )
+                            _topup_t0 = time.time()
+                            try:
+                                topupFilled, topupInfo = waitFillOrCancel(
+                                    bx, symbol, topupOrder["orderId"],
+                                    float(getattr(cfg, "entryFillTtlSec", cfg.orderTtl)), cfg.orderPoll,
+                                    dryRun=getattr(cfg, "dryRun", False),
+                                    side="BUY",
+                                    qty=topupQty,
+                                    price=topupPx,
+                                    maxRestRetries=int(getattr(cfg, "orderRestMaxRetries", 3)),
+                                    restBackoffSec=float(getattr(cfg, "orderRestBackoffSec", 0.2)),
+                                )
+                            except OrderStateUnknown as e:
+                                mark_order_state_unknown("BUY", topupOrder, e)
+                                topup_order_unknown = True
+                                topupFilled = False
+                                topupInfo = {}
+                                break
+                            _topup_fee = order_fee_summary(topupInfo, fallback_qty=topupQty, fallback_quote=topupQty * topupPx)
+                            logCsv({
+                                "ts_utc": local_timestamp(),
+                                "symbol": symbol,
+                                "event": "ORDER_FINAL",
+                                "side": "BUY",
+                                "qty": _topup_fee["executed_qty"],
+                                "price": topupPx,
+                                "notional": _topup_fee["quote_qty"],
+                                "order_id": topupInfo.get("orderId", topupOrder.get("orderId", "")),
+                                "client_order_id": topupInfo.get("clientOrderId", topupOrder.get("clientOrderId", "")),
+                                "exchange_status": topupInfo.get("status", ""),
+                                "fill_latency_ms": int((time.time() - _topup_t0) * 1000),
+                                "fee_source": _topup_fee["fee_source"],
+                                "fee_buy": _topup_fee["fee"],
+                                "commission_asset": _topup_fee["commission_asset"],
+                                "executed_qty": _topup_fee["executed_qty"],
+                                "quote_qty": _topup_fee["quote_qty"],
+                                **entry_edge_csv_fields(entry_edge),
+                            })
+                            if topupFilled:
+                                topupExecQty = float(topupInfo.get("executedQty", topupQty))
+                                topupQuoteQty = float(topupInfo.get("cummulativeQuoteQty", topupExecQty * topupPx))
+                                execQty += topupExecQty
+                                quoteQty += topupQuoteQty
+                                entryPx = quoteQty / execQty if execQty > 0 else entryPx
+                                logTrade(
+                                    f"BUY_TOPUP_FILLED attempt={topupAttempt} qty={topupExecQty:.8f} "
+                                    f"quote={topupQuoteQty:.8f} total_notional={quoteQty:.8f} "
+                                    f"entry={entryPx:.8f}"
+                                )
+                            else:
+                                logTrade(
+                                    f"BUY_TOPUP_NOFILL attempt={topupAttempt} current_notional={quoteQty:.8f} "
+                                    f"target={min_filled_notional:.8f}"
+                                )
+                                break
+                        except Exception as e:
+                            logErr("BUY_TOPUP_FAIL", e)
+                            logTrade(
+                                f"BUY_TOPUP_FAIL attempt={topupAttempt} current_notional={quoteQty:.8f} "
+                                f"target={min_filled_notional:.8f} err={type(e).__name__}:{e}"
+                            )
+                            break
+                    if topup_order_unknown:
+                        time.sleep(cfg.idleSleep)
+                        continue
+                    if quoteQty < float(minNotional):
+                        logTrade(
+                            f"BUY_BELOW_SELLABLE_NOTIONAL total_notional={quoteQty:.8f} "
+                            f"minNotional={float(minNotional):.8f} target={min_filled_notional:.8f}"
+                        )
+
+                if buy_below_sellable_notional(execQty, entryPx, float(minNotional)):
+                    logTrade(
+                        f"BUY_BELOW_SELLABLE_NOTIONAL symbol={symbol} side=BUY qty={execQty:.8f} "
+                        f"price={entryPx:.8f} notional={quoteQty:.8f} "
+                        f"min_notional={float(minNotional):.8f} reason=partial_buy_below_min_notional_after_topup"
+                    )
+                    logCsv({
+                        "ts_utc": local_timestamp(),
+                        "symbol": symbol,
+                        "event": "BUY_BELOW_SELLABLE_NOTIONAL",
+                        "side": "BUY",
+                        "qty": execQty,
+                        "price": entryPx,
+                        "notional": quoteQty,
+                        "min_notional": float(minNotional),
+                        "reason": "partial_buy_below_min_notional_after_topup",
+                        "order_id": info.get("orderId", order.get("orderId", "")),
+                        "client_order_id": info.get("clientOrderId", order.get("clientOrderId", "")),
+                        "exchange_status": info.get("status", ""),
+                        "executed_qty": execQty,
+                        "quote_qty": quoteQty,
+                        **entry_edge_csv_fields(entry_edge),
+                    })
+                    syncState["next"] = 0.0
+                    cooldownUntil = time.time() + float(getattr(cfg, "dustCooldownSec", 60))
+                    pos = None
+                    time.sleep(float(getattr(cfg, "idleSleep", 2)))
+                    continue
+
+                if pos is None:
+                    pos = Position(qty=execQty, entry=entryPx, high=entryPx, stop=0.0, ts_entry=time.time())
+                    pos.sessionHighPrice = entryPx
+                    pos.init_stops(cfg, profile, tick=tick)
+                else:
+                    # add to existing position (weighted average)
+                    old_qty = float(getattr(pos, 'qty', 0.0))
+                    old_entry = float(getattr(pos, 'entry', 0.0))
+                    new_qty = old_qty + execQty
+                    if new_qty > 0:
+                        new_entry = ((old_qty * old_entry) + quoteQty) / new_qty
+                        pos.qty = new_qty
+                        pos.entry = new_entry
+                        pos.sessionHighPrice = max(float(getattr(pos, "sessionHighPrice", 0.0) or 0.0), new_entry)
+                        try:
+                            pos.high = max(float(getattr(pos, 'high', new_entry)), float(bid))
+                        except Exception:
+                            pos.high = float(getattr(pos, 'high', new_entry))
+                        pos.init_stops(cfg, profile, tick=tick)
+
+                setattr(pos, "burstMode", bool(burstOverride))
+                setattr(pos, "burstBaseReturnPct", float(burstStats.get("return_pct", 0.0) or 0.0))
+                setattr(pos, "burstTriggerElapsedSec", float(burstStats.get("elapsed_sec", 0.0) or 0.0))
+                setattr(pos, "burstEntryMode", entryMode)
+                setattr(pos, "burstHandoffLogged", False)
+                # Persist entry for restart recovery
+                try:
+                    _pos_file = runtime_dir / "active_position.json"
+                    import json as _json
+                    _pos_file.parent.mkdir(parents=True, exist_ok=True)
+                    _pos_file.write_text(_json.dumps({
+                        "symbol": symbol,
+                        "entry": float(getattr(pos, 'entry', 0.0)),
+                        "qty": float(getattr(pos, 'qty', 0.0)),
+                        "ts_entry": float(getattr(pos, 'ts_entry', time.time())),
+                        "session_high_price": _session_high_value(pos),
+                        "high": _session_high_value(pos),
+                    }), encoding="utf-8")
+                except Exception:
+                    pass
+                entry_market = market_ctx if market_ctx is not None else object()
+                setattr(pos, "entryRet1m", float(getattr(entry_market, "ret_1m", 0.0)))
+                setattr(pos, "entryRet3m", float(getattr(entry_market, "ret_3m", 0.0)))
+                setattr(pos, "entryRet5m", float(getattr(entry_market, "ret_5m", 0.0)))
+                setattr(pos, "entryRange5m", float(getattr(entry_market, "range_5m", 0.0)))
+
+                sync_log_day_anchor(pos)
+                if burstOverride:
+                    entry_reason = (
+                        f"BURST ret={burstStats['return_pct']*100:.4f}% "
+                        f"vel={burstStats['velocity_pct_per_sec']*100:.4f}%/s "
+                        f"eff={burstStats['efficiency']:.3f} "
+                        f"pressure={burstStats['pressure_ratio']:.2f} "
+                        f"drop={burstStats['max_single_drop_pct']*100:.4f}%"
+                    )
+                elif rangeOverride:
+                    entry_reason = (
+                        f"RANGE_V1 low={range_snapshot.low:.2f} high={range_snapshot.high:.2f} "
+                        f"entry_zone={range_plan.entryZone:.2f} target={range_plan.targetPrice:.2f} "
+                        f"stop={range_plan.stopPrice:.2f} rr={range_plan.rewardRisk:.2f}"
+                    )
+                else:
+                    entry_reason = f"PBUY P1={P1} P2={P2} P3={P3} P4={P4}"
+                print("BUY_FILLED", getattr(pos, 'qty', ''), "@", fmt(getattr(pos, 'entry', 0.0)), "STOP", fmt(getattr(pos, 'stop', 0.0)))
+                logTrade(
+                    f"BUY symbol={symbol} qty={getattr(pos,'qty','')} entry={getattr(pos,'entry','')} "
+                    f"mode={entryMode} reason={entry_reason} P1={P1} P2={P2} P3={P3} P4={P4}"
+                )
+                entry_vs_mid_pct = ((float(getattr(pos, 'entry', 0.0)) - float(mid)) / float(mid) * 100.0) if mid > 0 else ""
+                logCsv({
+                    "ts_utc": local_timestamp(),
+                    "symbol": symbol,
+                    "event": "BUY_FILLED",
+                    "side": "BUY",
+                    "qty": getattr(pos, 'qty', ''),
+                    "price": getattr(pos, 'entry', ''),
+                    "reason": entry_reason,
+                    "pnl": "",
+                    "profile": profile.name,
+                    "dry_run": int(getattr(cfg, "dryRun", False)),
+                    "mom_pct": float(momPct) * 100.0,
+                    "mom_range_pct": float(momRangePct) * 100.0,
+                    "up_ratio": float(upRatio) * 100.0,
+                    "rsi": "" if rsi_now is None else rsi_now,
+                    "ema1_ok": "" if ema1_ok is None else int(bool(ema1_ok)),
+                    "ema5_ok": "" if ema5_ok is None else int(bool(ema5_ok)),
+                    "vol_ok": "" if vol_ok is None else int(bool(vol_ok)),
+                    "spread_pct": float(spread) * 100.0,
+                    "bid": float(bid),
+                    "ask": float(ask),
+                    "mid": float(mid),
+                    "entry_price": float(getattr(pos, 'entry', 0.0)),
+                    "p1": "" if P1 is None else float(P1),
+                    "p2": "" if P2 is None else float(P2),
+                    "p3": "" if P3 is None else float(P3),
+                    "p4": "" if P4 is None else float(P4),
+                    "entry_vs_mid_pct": entry_vs_mid_pct,
+                    "mid_vs_entry_pct": "",
+                    "notional": quoteQty,
+                    "min_notional": float(minNotional),
+                    "step_size": float(step),
+                    "tick_size": float(tick),
+                    "entry_mode": entryMode,
+                    "order_id": info.get("orderId", order.get("orderId", "")),
+                    "client_order_id": info.get("clientOrderId", order.get("clientOrderId", "")),
+                    "exchange_status": info.get("status", ""),
+                    "fee_source": _buy_fee["fee_source"],
+                    "fee_buy": _buy_fee["fee"],
+                    "commission_asset": _buy_fee["commission_asset"],
+                    "executed_qty": execQty,
+                    "quote_qty": quoteQty,
+                    **entry_edge_csv_fields(entry_edge),
+                })
+                # Persister la position sur disque (survit aux restarts)
+                _pp = PersistedPosition(
+                    symbol=symbol,
+                    entry_price=float(getattr(pos, 'entry', 0.0)),
+                    entry_qty=float(getattr(pos, 'qty', 0.0)),
+                    entry_ts=float(getattr(pos, 'ts_entry', time.time())),
+                    entry_reason=entryMode,
+                    high_seen=_session_high_value(pos),
+                    buy_notional=float(getattr(pos, 'entry', 0.0)) * float(getattr(pos, 'qty', 0.0)),
+                )
+                save_position(_pp, _persisted_path)
+                # Init position dynamics — try to load if restart, else create fresh
+                if bool(getattr(cfg, "positionDynamics_enabled", True)):
+                    _dyn_existing = load_dynamics(_dynamics_path)
+                    if _dyn_existing and abs(_dyn_existing.entry_price - float(getattr(pos, 'entry', 0.0))) < 0.000001:
+                        _dyn = _dyn_existing  # surviving restart with matching entry
+                    else:
+                        _dyn = init_dynamics(
+                            float(getattr(pos, 'entry', 0.0)),
+                            float(getattr(pos, 'ts_entry', time.time())),
+                            bid,
+                        )
+                        save_dynamics(_dyn, _dynamics_path)
+                continue
+
+            if pos is None:
+                if not buySignal:
+                    if pendingSwitchSymbol:
+                        hold_reason = "HOLD_TOKEN_SWITCH_PENDING"
+                        hold_detail = f"pending_symbol={pendingSwitchSymbol}"
+                    elif not has_new_tick:
+                        hold_reason = "HOLD_NO_NEW_TICK"
+                        hold_detail = f"tick_seq={tick_seq}"
+                    elif not pEntryEnabled and not range_signal and not burstOk:
+                        hold_reason = "HOLD_NO_ENTRY_SIGNAL"
+                        hold_detail = (
+                            f"p_entry=0 range_signal=0 burst_ok=0 "
+                            f"burst_enabled={int(bool(getattr(cfg, 'burstEntryEnabled', False)))}"
+                        )
+                    elif pEntryEnabled and any(v is None for v in (P1, P2, P3, P4)):
+                        hold_reason = "HOLD_PDATA"
+                        hold_detail = "waiting_for_p_window"
+                    else:
+                        hold_reason = "HOLD_NO_ENTRY_SIGNAL"
+                        p_progress = ((float(P1) - float(P4)) / float(P4) * 100.0) if P1 is not None and P4 not in (None, 0) else 0.0
+                        _burst_ret = float((burstStats or {}).get("return_pct", 0.0) or 0.0) * 100.0
+                        _burst_need = float((burstStats or {}).get("required_return_pct", 0.0) or 0.0) * 100.0
+                        _burst_eff = float((burstStats or {}).get("efficiency", 0.0) or 0.0)
+                        _burst_pressure = float((burstStats or {}).get("pressure_ratio", 0.0) or 0.0)
+                        hold_detail = (
+                            f"mom_ok={int(bool(momOk))} mom_min={float(momMinPct)*100:.4f}% "
+                            f"up_min={float(momMinUpRatio)*100:.2f}% "
+                            f"range_signal={int(bool(range_signal))} "
+                            f"burst_ok={int(bool(burstOk))} burst_ret={_burst_ret:.4f}% "
+                            f"burst_need={_burst_need:.4f}% burst_eff={_burst_eff:.3f} "
+                            f"burst_pressure={_burst_pressure:.2f} "
+                            f"p_entry={int(bool(pEntryEnabled))} p_progress={p_progress:.4f}%"
+                        )
+                    maybe_hold(
+                        now,
+                        hold_reason,
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=hold_detail,
+                    )
+                time.sleep(cfg.idleSleep)
+                continue
+
+            # ===== EXIT =====
+            position_market_ctx = signalCache.get("market")
+            if pos.entry > 0:
+                _, _, refreshed_market_ctx = load_signal_snapshot(time.time())
+                if refreshed_market_ctx is not None:
+                    position_market_ctx = refreshed_market_ctx
+
+            # If position was adopted from wallet (entry=0), treat as untracked.
+            # We do not fabricate an entry; we liquidate when sellable, otherwise we clear as dust.
+            sessionHighInfo = {}
+            if pos.entry <= 0:
+                exitReason = "WALLET_UNTRACKED"
+            else:
+                exitReason = None
+                sessionHighDrop, sessionHighInfo = pos.check_session_high_drop(bid)
+                if sessionHighDrop:
+                    exitReason = SESSION_HIGH_DROP_REASON
+                    try:
+                        logTrade(
+                            f"{SESSION_HIGH_DROP_REASON} "
+                            f"session_high_price={sessionHighInfo.get('session_high_price', 0.0):.8f} "
+                            f"current_price={sessionHighInfo.get('current_price', 0.0):.8f} "
+                            f"session_high_drop_pct={float(sessionHighInfo.get('session_high_drop_pct', 0.0))*100.0:.4f}%"
+                        )
+                    except Exception:
+                        pass
+                elif bool(sessionHighInfo.get("session_high_updated")):
+                    persist_open_position_state("SESSION_HIGH_UPDATE")
+                if exitReason is None:
+                    pos.update(bid, cfg, profile, tick=tick)
+                if (
+                    exitReason is None
+                    and
+                    has_new_tick
+                    and bool(getattr(cfg, "psellStrictPTapeExitEnabled", False))
+                ):
+                    exitReason = strict_p_tape_exit_reason(S1, S2, S3, S4)
+                if exitReason is None:
+                    exitReason = pos.exit_reason(bid, cfg, profile)
+
+            # Position dynamics: update per-tick, then check trailing/breakeven exits
+            if exitReason is None and pos is not None and pos.entry > 0 and bool(getattr(cfg, "positionDynamics_enabled", True)):
+                if _dyn is None:
+                    # Recover dynamics on unexpected restart
+                    _dyn = load_dynamics(_dynamics_path) or init_dynamics(float(pos.entry), float(getattr(pos, 'ts_entry', time.time())), bid)
+                _dyn = update_dynamics(_dyn, bid)
+                if has_new_tick:
+                    save_dynamics(_dyn, _dynamics_path)
+
+                # Trailing stop (priority over breakeven)
+                if bool(getattr(cfg, "trailingStop_enabled", True)):
+                    _ts_exit, _ts_reason = check_trailing_stop(
+                        _dyn, bid, _fee_model.fee_rate,
+                        trailing_drawdown_pct=float(getattr(cfg, "trailingStop_drawdownPct", 0.004)),
+                        min_gain_arming_pct=float(getattr(cfg, "trailingStop_minGainArmingPct", 0.005)),
+                    )
+                    if _ts_exit:
+                        exitReason = _ts_reason
+
+                # Breakeven escape
+                if exitReason is None and bool(getattr(cfg, "breakevenEscape_enabled", True)):
+                    _be_exit, _be_reason = check_breakeven_escape(
+                        _dyn, bid, _fee_model.fee_rate,
+                        min_gain_arming_pct=float(getattr(cfg, "breakevenEscape_minGainArmingPct", 0.003)),
+                        buffer_pct=float(getattr(cfg, "breakevenEscape_bufferPct", 0.0005)),
+                    )
+                    if _be_exit:
+                        exitReason = _be_reason
+
+                # Return-to-entry escape: after a meaningful drawdown, leave when price
+                # comes back close to the original buy price.
+                if exitReason is None and bool(getattr(cfg, "returnToEntry_enabled", False)):
+                    _rte_exit, _rte_reason = check_return_to_entry_escape(
+                        _dyn,
+                        bid,
+                        time.time(),
+                        min_drawdown_pct=float(getattr(cfg, "returnToEntry_minDrawdownPct", 0.004)),
+                        trigger_below_entry_pct=float(getattr(cfg, "returnToEntry_triggerBelowEntryPct", 0.0005)),
+                        min_age_sec=float(getattr(cfg, "returnToEntry_minAgeSec", 120.0)),
+                    )
+                    if _rte_exit:
+                        exitReason = _rte_reason
+
+            if exitReason is None and pos is not None and pos.entry > 0:
+                burstExit = burst_exit_reason(pos, bidTicks, bid, spread, cfg, logger=logTrade)
+                if burstExit:
+                    exitReason = burstExit
+
+            if (
+                exitReason is None
+                and pos is not None
+                and pos.entry > 0
+                and bool(getattr(cfg, "entryGuard_enabled", True))
+            ):
+                entryGuardExit = entry_guard_exit_reason(
+                    pos,
+                    bidTicks,
+                    bid,
+                    spread,
+                    momPct,
+                    upRatio,
+                    cfg,
+                    _fee_model.fee_rate,
+                )
+                if entryGuardExit:
+                    exitReason = entryGuardExit
+
+            # Additional SELL rules (P algo): use BID points when available.
+            # Exit weak losers earlier when the tape is rolling over or stalling too long.
+            if exitReason is None and (pos is not None) and (pos.entry > 0):
+                sellSignal = False
+                sellSignalMode = ""
+                if has_new_tick and (S1 is not None) and (S2 is not None) and (S3 is not None):
+                    age_sec = max(0.0, time.time() - float(getattr(pos, "ts_entry", time.time())))
+                    min_signal_exit_sec = max(
+                        float(getattr(cfg, "psellMinAgeSec", 25.0) or 25.0),
+                        float(getattr(cfg, "entryFillTtlSec", 2.5)) * 4.0,
+                    )
+                    weak_tape = (momPct <= 0.0) or (upRatio < max(0.35, float(getattr(cfg, "momMinUpRatio", 0.0)) * 0.6))
+                    min_loss_pct = max(
+                        float(getattr(cfg, "psellMinLossPct", 0.0035) or 0.0035),
+                        float(getattr(cfg, "feeBufPct", 0.0) or 0.0) * 1.25,
+                    )
+                    current_loss_pct = float(getattr(cfg, "psellCurrentLossPct", 0.0) or 0.0)
+                    if current_loss_pct <= 0.0:
+                        current_loss_pct = max(
+                            float(getattr(cfg, "feeBufPct", 0.0) or 0.0) * 1.25,
+                            min_loss_pct * 0.85,
+                        )
+                    stale_age_sec = float(getattr(cfg, "psellStaleAgeSec", 0.0) or 0.0)
+                    if stale_age_sec <= 0.0:
+                        stale_age_sec = max(
+                            min_signal_exit_sec * 2.0,
+                            min(120.0, float(getattr(cfg, "maxPosTime", 240.0) or 240.0) * 0.5),
+                        )
+                    stale_loss_pct = float(getattr(cfg, "psellStaleLossPct", 0.0) or 0.0)
+                    if stale_loss_pct <= 0.0:
+                        stale_loss_pct = max(
+                            float(getattr(cfg, "feeBufPct", 0.0) or 0.0) * 1.25,
+                            min_loss_pct * 0.75,
+                        )
+                    fail_age_sec = float(getattr(cfg, "psellFailAgeSec", 0.0) or 0.0)
+                    fail_loss_pct = float(getattr(cfg, "psellFailLossPct", 0.0) or 0.0)
+                    if fail_loss_pct <= 0.0:
+                        fail_loss_pct = max(
+                            float(getattr(cfg, "feeBufPct", 0.0) or 0.0) * 0.8,
+                            stale_loss_pct * 0.8,
+                        )
+                    fail_max_high_pct = float(getattr(cfg, "psellFailMaxHighPct", 0.0) or 0.0)
+                    if fail_max_high_pct <= 0.0:
+                        fail_max_high_pct = max(
+                            float(getattr(cfg, "feeBufPct", 0.0) or 0.0),
+                            min(
+                                max(
+                                    float(getattr(cfg, "protectArmPct", 0.0) or 0.0) * 0.75,
+                                    float(getattr(cfg, "armPct", 0.0) or 0.0) * 0.33,
+                                ),
+                                0.0020,
+                            ),
+                        )
+                    current_guard = float(pos.entry) * (1.0 - current_loss_pct)
+                    stale_guard = float(pos.entry) * (1.0 - stale_loss_pct)
+                    fail_guard = float(pos.entry) * (1.0 - fail_loss_pct)
+                    confirm_ticks = max(3, int(getattr(cfg, "psellConfirmTicks", 4) or 4))
+                    descending_tape = (S1 < S2) and (S2 < S3)
+                    if confirm_ticks >= 4 and (S4 is not None):
+                        descending_tape = descending_tape and (S3 < S4)
+                    latest_ref = min(float(bid), float(S1))
+                    peak_progress_pct = max(
+                        0.0,
+                        (float(getattr(pos, "high", float(pos.entry))) - float(pos.entry)) / float(pos.entry),
+                    )
+                    fast_signal = (
+                        age_sec >= min_signal_exit_sec
+                        and descending_tape
+                        and (latest_ref < current_guard)
+                        and weak_tape
+                    )
+                    fail_signal = (
+                        fail_age_sec > 0.0
+                        and age_sec >= fail_age_sec
+                        and (latest_ref < fail_guard)
+                        and (peak_progress_pct <= fail_max_high_pct)
+                        and weak_tape
+                    )
+                    stale_signal = (
+                        age_sec >= stale_age_sec
+                        and (latest_ref < stale_guard)
+                        and (weak_tape or descending_tape)
+                    )
+                    five_min_signal = False
+                    if position_market_ctx is not None:
+                        entry_ret_5m = float(getattr(pos, "entryRet5m", 0.0) or 0.0)
+                        current_ret_5m = float(getattr(position_market_ctx, "ret_5m", 0.0) or 0.0)
+                        five_min_age_sec = float(getattr(cfg, "psell5mAgeSec", 0.0) or 0.0)
+                        five_min_loss_pct = float(getattr(cfg, "psell5mLossPct", 0.0) or 0.0)
+                        five_min_drop_pct = float(getattr(cfg, "psell5mDropPct", 0.0) or 0.0)
+                        five_min_negative_ret_pct = float(getattr(cfg, "psell5mNegativeRetPct", 0.0) or 0.0)
+                        five_min_guard = float(pos.entry) * (1.0 - five_min_loss_pct)
+                        five_min_rolled_negative = (
+                            entry_ret_5m > five_min_negative_ret_pct
+                            and current_ret_5m <= five_min_negative_ret_pct
+                        )
+                        five_min_dropped = current_ret_5m <= (entry_ret_5m - five_min_drop_pct)
+                        five_min_signal = (
+                            five_min_age_sec > 0.0
+                            and age_sec >= five_min_age_sec
+                            and latest_ref < five_min_guard
+                            and weak_tape
+                            and (five_min_rolled_negative or five_min_dropped)
+                        )
+                    if fast_signal:
+                        sellSignal = True
+                        sellSignalMode = (
+                            f"FAST age={age_sec:.1f}s "
+                            f"latest={latest_ref:.8f} guard={current_guard:.8f}"
+                        )
+                    elif fail_signal:
+                        sellSignal = True
+                        sellSignalMode = (
+                            f"FAIL age={age_sec:.1f}s "
+                            f"latest={latest_ref:.8f} guard={fail_guard:.8f} "
+                            f"high={float(getattr(pos, 'high', pos.entry)):.8f} "
+                            f"peak={peak_progress_pct*100:.4f}%"
+                        )
+                    elif stale_signal:
+                        sellSignal = True
+                        sellSignalMode = (
+                            f"STALE age={age_sec:.1f}s "
+                            f"latest={latest_ref:.8f} guard={stale_guard:.8f}"
+                        )
+                    elif five_min_signal:
+                        sellSignal = True
+                        sellSignalMode = (
+                            f"ROLL5 age={age_sec:.1f}s "
+                            f"latest={latest_ref:.8f} "
+                            f"ret5m={current_ret_5m*100:.4f}% "
+                            f"entry5m={entry_ret_5m*100:.4f}% "
+                            f"delta5m={(current_ret_5m-entry_ret_5m)*100:.4f}%"
+                        )
+                if sellSignal:
+                    exitReason = (
+                        f"PSELL {sellSignalMode} "
+                        f"B1={S1} B2={S2} B3={S3} B4={S4} entry={pos.entry}"
+                    )
+            
+            if exitReason is None:
+                time.sleep(cfg.idleSleep)
+                continue
+
+            # Skip non-critical exits if expected PnL net would be negative (paying fees for nothing)
+            _fee_rate_exit = _fee_model.fee_rate  # use the single fee model, not a separate config key
+            _non_critical_exits = (
+                "TIME",
+                "PROTECT",
+                "PSELL STALE",
+                "PSELL FAST",
+                "PSELL FAIL",
+                "BURST_REVERSAL",
+                "ENTRY_GUARD_PROTECT",
+            )
+            _is_non_critical = any(exitReason.startswith(e) for e in _non_critical_exits)
+            _psell_negative_allowed = (
+                bool(getattr(cfg, "psellAllowNegativeExit", False))
+                and exitReason.startswith("PSELL")
+            )
+            if _is_non_critical and pos is not None and pos.entry > 0:
+                _exp_buy_cost = float(pos.entry) * float(getattr(pos, 'qty', 0.0))
+                _exp_sell_rev = float(bid) * float(getattr(pos, 'qty', 0.0))
+                _exp_fees = (_exp_buy_cost + _exp_sell_rev) * _fee_rate_exit
+                _exp_pnl_net = _exp_sell_rev - _exp_buy_cost - _exp_fees
+                _hard_stop_pct = float(getattr(cfg, 'psellMinLossPct', 0.005) or 0.005)
+                _is_hard_stop = float(bid) < float(pos.entry) * (1.0 - _hard_stop_pct * 2)
+                if (
+                    _exp_pnl_net < 0
+                    and not _is_hard_stop
+                    and not _psell_negative_allowed
+                    and not loss_exit_allowed(exitReason)
+                ):
+                    maybe_hold(
+                        now,
+                        "HOLD_NEGATIVE_EXIT",
+                        spread,
+                        momPct,
+                        momRangePct,
+                        upRatio,
+                        bid,
+                        ask,
+                        mid,
+                        P1,
+                        P2,
+                        P3,
+                        P4,
+                        detail=(
+                            f"exit={exitReason} expected_pnl={_exp_pnl_net:.6f} "
+                            f"fees={_exp_fees:.6f} hard_stop={int(_is_hard_stop)}"
+                        ),
+                    )
+                    time.sleep(cfg.idleSleep)
+                    continue
+
+            baseAsset = bx.base_asset(symbol) if hasattr(bx, "base_asset") else symbol.replace(str(getattr(cfg, "quoteAsset", "USDC")), "")
+            freeBase = get_asset_balance_safe(bx, cfg, baseAsset)
+            if freeBase is None:
+                try:
+                    logTrade("SELL_BAL_UNAVAILABLE")
+                except Exception:
+                    pass
+                time.sleep(cfg.idleSleep)
+                continue
+            sellQty = round_step(freeBase, step)
+
+            if sellQty <= 0 or (sellQty * bid) < float(minNotional):
+                try:
+                    print("DUST_SKIP_SELL", baseAsset, "qty", sellQty, "notional", sellQty * bid, "minNotional", minNotional, "step", step)
+                    logTrade(f"DUST_SKIP_SELL asset={baseAsset} qty={sellQty} notional={sellQty*bid} minNotional={minNotional} step={step}")
+                except Exception:
+                    pass
+                clear_runtime_position_state(
+                    "DUST_SKIP_SELL",
+                    detail=f"asset={baseAsset} qty={sellQty} notional={sellQty*bid:.8f} minNotional={float(minNotional):.8f}",
+                )
+                pos = None
+                cooldownUntil = time.time() + float(getattr(cfg, "dustCooldownSec", 60))
+                syncState["next"] = 0.0
+                time.sleep(cfg.idleSleep)
+                continue
+
+            sellPx = bid
+            sellPx = round_tick_down(sellPx, tick)
+            try:
+                print(
+                    "SELL_TRIGGER",
+                    "reason", exitReason,
+                    "qty", fmt(sellQty, step),
+                    "bid", fmt(bid, tick),
+                    "px", fmt(sellPx, tick),
+                    "entry", fmt(getattr(pos, "entry", 0.0), tick),
+                    "high", fmt(getattr(pos, "high", 0.0), tick),
+                    "session_high", fmt(_session_high_value(pos), tick),
+                    "stop", fmt(getattr(pos, "stop", 0.0), tick),
+                )
+            except Exception:
+                pass
+
+            try:
+                order = placeLimit(
+                    bx, symbol, "SELL",
+                    sellQty, sellPx,
+                    stepQ=step, tickQ=tick,
+                    dryRun=getattr(cfg, "dryRun", False)
+                )
+            except Exception as e:
+                msg = str(e)
+                low = msg.lower()
+                if ("MIN_NOTIONAL" in msg) or ("LOT_SIZE" in msg) or ("too small" in low) or ("insufficient" in low):
+                    try:
+                        notional = sellQty * bid
+                        print("DUST_SKIP_SELL", baseAsset, "qty", sellQty, "notional", notional, "minNotional", minNotional, "step", step, "msg", msg)
+                        logTrade(f"DUST_SKIP_SELL asset={baseAsset} qty={sellQty} notional={notional} minNotional={minNotional} step={step} msg={msg}")
+                    except Exception:
+                        pass
+                    clear_runtime_position_state(
+                        "DUST_SKIP_SELL_REJECTED",
+                        detail=f"asset={baseAsset} qty={sellQty} notional={notional:.8f} minNotional={float(minNotional):.8f}",
+                    )
+                    pos = None
+                    cooldownUntil = time.time() + float(getattr(cfg, "dustCooldownSec", 60))
+                    syncState["next"] = 0.0
+                    time.sleep(cfg.idleSleep)
+                    continue
+                raise
+
+            _sell_order_t0 = time.time()
+            try:
+                filled, info = waitFillOrCancel(
+                    bx, symbol, order["orderId"],
+                    cfg.orderTtl, cfg.orderPoll,
+                    dryRun=getattr(cfg, "dryRun", False),
+                    side="SELL",
+                    qty=sellQty,
+                    price=sellPx,
+                    maxRestRetries=int(getattr(cfg, "orderRestMaxRetries", 3)),
+                    restBackoffSec=float(getattr(cfg, "orderRestBackoffSec", 0.2)),
+                )
+            except OrderStateUnknown as e:
+                mark_order_state_unknown("SELL", order, e)
+                time.sleep(cfg.idleSleep)
+                continue
+            _sell_fee = order_fee_summary(info, fallback_qty=sellQty, fallback_quote=sellQty * sellPx)
+            logCsv({
+                "ts_utc": local_timestamp(),
+                "symbol": symbol,
+                "event": "ORDER_FINAL",
+                "side": "SELL",
+                "qty": _sell_fee["executed_qty"],
+                "price": sellPx,
+                "notional": _sell_fee["quote_qty"],
+                "order_id": info.get("orderId", order.get("orderId", "")),
+                "client_order_id": info.get("clientOrderId", order.get("clientOrderId", "")),
+                "exchange_status": info.get("status", ""),
+                "fill_latency_ms": int((time.time() - _sell_order_t0) * 1000),
+                "exit_reason": exitReason,
+                "exit_reason_raw": exitReason,
+                "session_high_price": sessionHighInfo.get("session_high_price", _session_high_value(pos)),
+                "current_price": sessionHighInfo.get("current_price", bid),
+                "session_high_drop_pct": float(sessionHighInfo.get("session_high_drop_pct", 0.0) or 0.0) * 100.0,
+                "fee_source": _sell_fee["fee_source"],
+                "fee_sell": _sell_fee["fee"],
+                "commission_asset": _sell_fee["commission_asset"],
+                "executed_qty": _sell_fee["executed_qty"],
+                "quote_qty": _sell_fee["quote_qty"],
+            })
+            
+            if not filled:
+                print("SELL_NOFILL", exitReason)
+                time.sleep(cfg.idleSleep)
+                continue
+            
+            execQty = float(info.get("executedQty", sellQty))
+            filledQty = execQty if execQty > 0 else sellQty
+            quoteQty = float(info.get("cummulativeQuoteQty", filledQty * sellPx))
+            exitPx = quoteQty / filledQty if filledQty > 0 else sellPx
+            buy_cost = float(getattr(pos, 'entry', 0.0)) * filledQty
+            sell_revenue = quoteQty
+            _pnl_detail = _fee_model.compute_net_pnl(
+                float(getattr(pos, 'entry', exitPx)), filledQty,
+                exitPx, filledQty, symbol
+            )
+            pnl = _pnl_detail["net_pnl"]
+            pnl_gross = _pnl_detail["gross_pnl"]
+            daily_pnl_net += pnl
+            _circuit_breaker.record_trade(pnl)
+            is_partial_sell = filledQty < max(0.0, sellQty - (float(step) * 0.5))
+            mid_vs_entry_pct = ((float(mid) - float(pos.entry)) / float(pos.entry) * 100.0) if pos.entry > 0 else ""
+            exit_s1, exit_s5, _ = load_signal_snapshot(time.time())
+            exit_rsi = ""
+            exit_ema1_ok = ""
+            exit_ema5_ok = ""
+            exit_vol_ok = ""
+            if exit_s1 is not None and exit_s5 is not None:
+                try:
+                    exit_rsi = float(getattr(exit_s1, "rsi", 0.0))
+                    exit_ema1_ok = int(bool(getattr(exit_s1, "ema_ok", False)))
+                    exit_ema5_ok = int(bool(getattr(exit_s5, "ema_ok", False)))
+                    exit_vol_ok = int(bool(getattr(exit_s1, "vol_ok", False)))
+                except Exception:
+                    exit_rsi = ""
+                    exit_ema1_ok = ""
+                    exit_ema5_ok = ""
+                    exit_vol_ok = ""
+            
+            sell_event = "SELL_PARTIAL_FILLED" if is_partial_sell else "SELL_FILLED"
+            print(sell_event, filledQty, "@", fmt(exitPx), "PNL", fmt(pnl, Decimal('0.0001')), exitReason)
+            logTrade(
+                f"SELL symbol={symbol} event={sell_event} qty={filledQty} exit={exitPx} pnl={pnl} "
+                f"reason={exitReason} profile={profile.name} "
+                f"session_high_price={sessionHighInfo.get('session_high_price', _session_high_value(pos))} "
+                f"current_price={sessionHighInfo.get('current_price', bid)} "
+                f"session_high_drop_pct={float(sessionHighInfo.get('session_high_drop_pct', 0.0) or 0.0)*100.0}"
+            )
+            logCsv({
+                "ts_utc": local_timestamp(),
+                "symbol": symbol,
+                "event": sell_event,
+                "side": "SELL",
+                "qty": filledQty,
+                "price": exitPx,
+                "reason": exitReason,
+                "pnl": pnl,
+                "pnl_net": _pnl_detail["net_pnl"],
+                "profile": profile.name,
+                "dry_run": int(getattr(cfg, "dryRun", False)),
+                "spread_pct": float(spread) * 100.0,
+                "mom_pct": float(momPct) * 100.0,
+                "mom_range_pct": float(momRangePct) * 100.0,
+                "up_ratio": float(upRatio) * 100.0,
+                "rsi": exit_rsi,
+                "ema1_ok": exit_ema1_ok,
+                "ema5_ok": exit_ema5_ok,
+                "vol_ok": exit_vol_ok,
+                "bid": float(bid),
+                "ask": float(ask),
+                "mid": float(mid),
+                "entry_price": float(pos.entry),
+                "p1": "" if P1 is None else float(P1),
+                "p2": "" if P2 is None else float(P2),
+                "p3": "" if P3 is None else float(P3),
+                "p4": "" if P4 is None else float(P4),
+                "entry_vs_mid_pct": "",
+                "mid_vs_entry_pct": mid_vs_entry_pct,
+                "notional": quoteQty,
+                "min_notional": float(minNotional),
+                "step_size": float(step),
+                "tick_size": float(tick),
+                "exit_reason": exitReason,
+                "exit_reason_raw": exitReason,
+                "session_high_price": sessionHighInfo.get("session_high_price", _session_high_value(pos)),
+                "current_price": sessionHighInfo.get("current_price", bid),
+                "session_high_drop_pct": float(sessionHighInfo.get("session_high_drop_pct", 0.0) or 0.0) * 100.0,
+                "order_id": info.get("orderId", order.get("orderId", "")),
+                "client_order_id": info.get("clientOrderId", order.get("clientOrderId", "")),
+                "exchange_status": info.get("status", ""),
+                "fee_source": _sell_fee["fee_source"],
+                "fee_buy": _pnl_detail["fees_buy"],
+                "fee_sell": _sell_fee["fee"] if _sell_fee["fee_source"] == "exchange" else _pnl_detail["fees_sell"],
+                "commission_asset": _sell_fee["commission_asset"],
+                "executed_qty": filledQty,
+                "quote_qty": quoteQty,
+                "pnl_gross": pnl_gross,
+                "pnl_net_pct": _pnl_detail.get("net_pnl_pct", ""),
+            })
+
+            lastExitInfo = {
+                "symbol": symbol,
+                "ts": time.time(),
+                "reason": exitReason,
+                "pnl": pnl,
+                "entry": float(pos.entry),
+                "exit": float(exitPx),
+            }
+
+            remainingQty = round_step(max(0.0, float(freeBase or 0.0) - float(filledQty or 0.0)), step)
+            remainingNotional = remainingQty * bid
+            if remainingQty > 0 and remainingNotional >= float(minNotional):
+                pos.qty = remainingQty
+                try:
+                    pos.high = max(float(getattr(pos, "high", pos.entry)), float(bid))
+                except Exception:
+                    pass
+                try:
+                    _pos_file = runtime_dir / "active_position.json"
+                    _pos_file.parent.mkdir(parents=True, exist_ok=True)
+                    _pos_file.write_text(json.dumps({
+                        "symbol": symbol,
+                        "entry": float(getattr(pos, 'entry', 0.0)),
+                        "qty": float(getattr(pos, 'qty', 0.0)),
+                        "ts_entry": float(getattr(pos, 'ts_entry', time.time())),
+                        "session_high_price": _session_high_value(pos),
+                        "high": _session_high_value(pos),
+                    }), encoding="utf-8")
+                    save_position(PersistedPosition(
+                        symbol=symbol,
+                        entry_price=float(getattr(pos, 'entry', 0.0)),
+                        entry_qty=float(getattr(pos, 'qty', 0.0)),
+                        entry_ts=float(getattr(pos, 'ts_entry', time.time())),
+                        entry_reason="PARTIAL_SELL_REMAINING",
+                        high_seen=_session_high_value(pos),
+                        buy_notional=float(getattr(pos, 'entry', 0.0)) * float(getattr(pos, 'qty', 0.0)),
+                    ), _persisted_path)
+                    logTrade(
+                        f"SELL_PARTIAL_REMAINING symbol={symbol} qty={remainingQty} "
+                        f"notional={remainingNotional} minNotional={minNotional}"
+                    )
+                except Exception:
+                    pass
+                syncState["next"] = 0.0
+                time.sleep(cfg.idleSleep)
+                continue
+
+            clear_runtime_position_state("SELL_FILLED")
+
+            # cooldown and reset
+            cooldownUntil = time.time() + (cfg.cooldownWin if pnl > 0 else cfg.cooldownLoss)
+            pos = None
+            # force immediate resync after sell
+            syncState["next"] = 0.0
+            
+            
+        except Exception as e:
+            try:
+                logErr("LOOP_EXCEPTION", e)
+            except Exception:
+                pass
+            print("LOOP_EXCEPTION", type(e).__name__, str(e))
+            time.sleep(1.0)
+            continue
+if __name__ == "__main__":
+    main()

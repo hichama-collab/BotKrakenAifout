@@ -1,0 +1,426 @@
+{% extends "base.html" %}
+{% block title %}Radar{% endblock %}
+{% block head_extra %}
+<link rel="stylesheet" href="/static/radar.css" />
+{% endblock %}
+
+{% block content %}
+<div x-data="tokenRadar()" x-init="init()" class="page-content radar-page">
+  <section class="radar-head">
+    <div>
+      <h1>Token Radar</h1>
+      <p x-text="summaryText()"></p>
+    </div>
+    <button class="radar-btn radar-btn-primary" @click="loadAll()" :disabled="loading">
+      <span x-text="loading ? 'Refresh…' : 'Refresh'"></span>
+    </button>
+  </section>
+
+  <section class="radar-panel radar-picks">
+    <div class="radar-panel-title">
+      <h2>Selection rapide</h2>
+      <span>3-4 tokens propres</span>
+    </div>
+    <div class="pick-grid">
+      <template x-for="row in picks" :key="row.symbol">
+        <button class="pick-card" @click="select(row.symbol)">
+          <span class="pick-symbol" x-text="row.symbol"></span>
+          <span class="pick-score" x-text="fmt(scoreValue(row), 1)"></span>
+          <span :class="'risk-badge ' + riskClass(row.risk_level)" x-text="riskText(row)"></span>
+          <span class="pick-line">
+            <em x-text="'Hot ' + fmt(row.hot_score, 0)"></em>
+            <em x-text="'1h ' + pct(row.change_1h_pct)"></em>
+            <em x-text="'Vol ' + pct(amplitudeValue(row))"></em>
+            <em x-show="Number(row.negative_pressure_score || 0) >= 25" x-text="'Neg ' + fmt(row.negative_pressure_score, 0)"></em>
+          </span>
+          <small x-text="row.reason || row.risk_reason"></small>
+        </button>
+      </template>
+      <div x-show="!picks.length" class="empty">Aucune selection stable pour le moment</div>
+    </div>
+  </section>
+
+  <section class="radar-filters">
+    <label>
+      <span>Period</span>
+      <select x-model="filters.period" @change="loadTop()">
+        <option value="5m">5m</option>
+        <option value="15m">15m</option>
+        <option value="30m">30m</option>
+        <option value="1h">1h</option>
+        <option value="2h">2h</option>
+        <option value="4h">4h</option>
+        <option value="24h">24h</option>
+        <option value="3d">3d</option>
+        <option value="7d">7d</option>
+      </select>
+    </label>
+    <label>
+      <span>Min score</span>
+      <input type="number" min="0" max="100" step="1" x-model.number="filters.min_score" @change="loadTop()" />
+    </label>
+    <label>
+      <span>Min volume</span>
+      <input type="number" min="0" step="100000" x-model.number="filters.min_volume" @change="loadTop()" />
+    </label>
+    <label>
+      <span>Max spread optionnel</span>
+      <input type="number" min="0" step="0.0001" placeholder="aucun" x-model="filters.max_spread" @change="loadTop()" />
+    </label>
+    <label>
+      <span>Limit</span>
+      <input type="number" min="5" max="1000" step="5" x-model.number="filters.limit" @change="loadTop()" />
+    </label>
+    <label class="radar-check">
+      <input type="checkbox" x-model="filters.favorites_only" @change="loadTop()" />
+      <span>Favoris</span>
+    </label>
+  </section>
+
+  <section class="radar-grid">
+    <div class="radar-panel radar-main">
+      <div class="radar-panel-title">
+        <h2>Top tokens</h2>
+        <span x-text="top.length + ' lignes'"></span>
+      </div>
+      <div class="radar-table-wrap">
+        <table class="radar-table">
+          <thead>
+            <tr>
+              <th><button @click="sortBy('rank')">Rank <span x-text="sortMark('rank')"></span></button></th>
+              <th><button @click="sortBy('symbol')">Symbol <span x-text="sortMark('symbol')"></span></button></th>
+              <th><button @click="sortBy('price')">Price <span x-text="sortMark('price')"></span></button></th>
+              <th><button @click="sortBy('score')">Score <span x-text="sortMark('score')"></span></button></th>
+              <th><button @click="sortBy('hot')">Hot <span x-text="sortMark('hot')"></span></button></th>
+              <th><button @click="sortBy('reliability')">Fiabilite <span x-text="sortMark('reliability')"></span></button></th>
+              <th><button @click="sortBy('volatility')">Vol <span x-text="sortMark('volatility')"></span></button></th>
+              <th><button @click="sortBy('negative')">Neg <span x-text="sortMark('negative')"></span></button></th>
+              <th><button @click="sortBy('5m')">5m <span x-text="sortMark('5m')"></span></button></th>
+              <th><button @click="sortBy('15m')">15m <span x-text="sortMark('15m')"></span></button></th>
+              <th><button @click="sortBy('1h')">1h <span x-text="sortMark('1h')"></span></button></th>
+              <th><button @click="sortBy('4h')">4h <span x-text="sortMark('4h')"></span></button></th>
+              <th><button @click="sortBy('24h')">24h <span x-text="sortMark('24h')"></span></button></th>
+              <th><button @click="sortBy('3d')">3d <span x-text="sortMark('3d')"></span></button></th>
+              <th><button @click="sortBy('7d')">7d <span x-text="sortMark('7d')"></span></button></th>
+              <th><button @click="sortBy('volume')">Vol 24h <span x-text="sortMark('volume')"></span></button></th>
+              <th><button @click="sortBy('spread')">Spread <span x-text="sortMark('spread')"></span></button></th>
+              <th><button @click="sortBy('distance_high')">Dist high <span x-text="sortMark('distance_high')"></span></button></th>
+              <th><button @click="sortBy('signal')">Signal <span x-text="sortMark('signal')"></span></button></th>
+              <th><button @click="sortBy('reason')">Raison <span x-text="sortMark('reason')"></span></button></th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="(row, idx) in sortedTop" :key="row.symbol">
+              <tr @click="select(row.symbol)">
+                <td class="muted" x-text="row._rank || idx + 1"></td>
+                <td><strong x-text="row.symbol"></strong></td>
+                <td class="num" x-text="price(row.price)"></td>
+                <td><span class="score-pill" :class="scoreClass(scoreValue(row))" x-text="fmt(scoreValue(row), 1)"></span></td>
+                <td><span class="score-pill hot-pill" x-text="fmt(row.hot_score, 0)"></span></td>
+                <td><span :class="'risk-badge ' + riskClass(row.risk_level)" x-text="riskText(row)"></span></td>
+                <td :class="amplitudeClass(amplitudeValue(row))" x-text="pct(amplitudeValue(row))"></td>
+                <td :class="negativeClass(row.negative_pressure_score)" x-text="fmt(row.negative_pressure_score, 0)"></td>
+                <td :class="pctClass(row.change_5m_pct)" x-text="pct(row.change_5m_pct)"></td>
+                <td :class="pctClass(row.change_15m_pct)" x-text="pct(row.change_15m_pct)"></td>
+                <td :class="pctClass(row.change_1h_pct)" x-text="pct(row.change_1h_pct)"></td>
+                <td :class="pctClass(row.change_4h_pct)" x-text="pct(row.change_4h_pct)"></td>
+                <td :class="pctClass(row.change_24h_pct)" x-text="pct(row.change_24h_pct)"></td>
+                <td :class="pctClass(row.change_3d_pct)" x-text="pct(row.change_3d_pct)"></td>
+                <td :class="pctClass(row.change_7d_pct)" x-text="pct(row.change_7d_pct)"></td>
+                <td class="num" x-text="compact(row.quote_volume_24h)"></td>
+                <td class="num" x-text="pct(row.spread_pct)"></td>
+                <td :class="pctClass(row.distance_high_24h_pct)" x-text="pct(row.distance_high_24h_pct)"></td>
+                <td><span class="signal" x-text="row.signal"></span></td>
+                <td class="reason-cell" :title="reasonText(row)" x-text="reasonText(row)"></td>
+                <td>
+                  <button class="radar-icon-btn" @click.stop="addFav(row.symbol)">＋</button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="!top.length">
+              <td colspan="21" class="empty">Aucune donnée radar disponible</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <aside class="radar-panel radar-side">
+      <div class="radar-panel-title">
+        <h2>Favoris</h2>
+        <span x-text="favorites.length"></span>
+      </div>
+      <div class="favorite-list">
+        <template x-for="fav in favorites" :key="fav.symbol">
+          <div class="favorite-row" @click="select(fav.symbol)">
+            <div>
+              <strong x-text="fav.symbol"></strong>
+              <span x-text="fav.last_signal || 'WATCH'"></span>
+            </div>
+            <div class="favorite-metrics">
+              <span x-text="perfSinceAdd(fav)"></span>
+              <span x-text="fmt(fav.current_score, 1)"></span>
+              <button @click.stop="removeFav(fav.symbol)">×</button>
+            </div>
+          </div>
+        </template>
+        <div x-show="!favorites.length" class="empty">Aucun favori</div>
+      </div>
+
+      <div class="token-detail" x-show="detail.latest">
+        <div class="radar-panel-title">
+          <h2 x-text="detail.symbol"></h2>
+          <span x-text="detail.latest ? detail.latest.signal : ''"></span>
+        </div>
+        <div class="detail-grid" x-show="detail.latest">
+          <div><span>Price</span><strong x-text="price(detail.latest?.price)"></strong></div>
+          <div><span>Score</span><strong x-text="fmt(scoreValue(detail.latest), 1)"></strong></div>
+          <div><span>Hot</span><strong x-text="fmt(detail.latest?.hot_score, 0)"></strong></div>
+          <div><span>Fiabilite</span><strong x-text="riskText(detail.latest)"></strong></div>
+          <div><span>Vol</span><strong x-text="pct(amplitudeValue(detail.latest))"></strong></div>
+          <div><span>Neg</span><strong x-text="fmt(detail.latest?.negative_pressure_score, 0)"></strong></div>
+          <div><span>Momentum</span><strong x-text="fmt(detail.latest?.momentum_score, 1)"></strong></div>
+          <div><span>Liquidity</span><strong x-text="fmt(detail.latest?.liquidity_score, 1)"></strong></div>
+          <div><span>Spread</span><strong x-text="pct(detail.latest?.spread_pct)"></strong></div>
+          <div><span>High dist</span><strong x-text="pct(detail.latest?.distance_high_24h_pct)"></strong></div>
+          <div><span>Fiab score</span><strong x-text="fmt(detail.latest?.reliability_score ?? detail.latest?.consistency_score, 0)"></strong></div>
+          <div><span>Raison fiab</span><strong x-text="detail.latest?.risk_reason || '—'"></strong></div>
+        </div>
+        <p class="reason" x-text="detail.latest ? detail.latest.reason : ''"></p>
+        <div class="history-list">
+          <template x-for="row in detail.history.slice(0, 8)" :key="row.id">
+            <div>
+              <span x-text="shortDate(row.created_at)"></span>
+              <strong x-text="fmt(scoreValue(row), 1)"></strong>
+              <em :class="pctClass(row.change_1h_pct)" x-text="pct(row.change_1h_pct)"></em>
+            </div>
+          </template>
+        </div>
+      </div>
+    </aside>
+  </section>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function tokenRadar() {
+  return {
+    loading: false,
+    error: '',
+    top: [],
+    favorites: [],
+    detail: {symbol: '', latest: null, history: []},
+    filters: {
+      period: '1h',
+      min_score: 0,
+      min_volume: 0,
+      max_spread: '',
+      favorites_only: false,
+      limit: 500,
+    },
+    sort: {key: 'score', dir: 'desc'},
+    sortMap: {
+      rank: '_rank',
+      symbol: 'symbol',
+      price: 'price',
+      score: 'score',
+      hot: 'hot_score',
+      reliability: 'reliability_score',
+      volatility: 'amplitude_pct',
+      negative: 'negative_pressure_score',
+      '5m': 'change_5m_pct',
+      '15m': 'change_15m_pct',
+      '1h': 'change_1h_pct',
+      '4h': 'change_4h_pct',
+      '24h': 'change_24h_pct',
+      '3d': 'change_3d_pct',
+      '7d': 'change_7d_pct',
+      volume: 'quote_volume_24h',
+      spread: 'spread_pct',
+      distance_high: 'distance_high_24h_pct',
+      signal: 'signal',
+      reason: 'reason',
+    },
+    async init() { await this.loadAll(); },
+    get sortedTop() {
+      const key = this.sort.key;
+      const dir = this.sort.dir === 'asc' ? 1 : -1;
+      return [...this.top].sort((a, b) => this.compareRows(a, b, key) * dir);
+    },
+    get picks() {
+      return [...this.top]
+        .filter(row => ['LOW', 'MEDIUM'].includes(row.risk_level || 'MEDIUM'))
+        .filter(row => Number(row.negative_pressure_score || 0) < 35)
+        .filter(row => Number(row.change_1h_pct || 0) > 0 || Number(row.hot_score || 0) >= 45)
+        .sort((a, b) => {
+          const left = Number(this.scoreValue(b) || 0) - Number(this.scoreValue(a) || 0);
+          if (left) return left;
+          const hot = Number(b.hot_score || 0) - Number(a.hot_score || 0);
+          if (hot) return hot;
+          return Number(b.reliability_score || b.consistency_score || 0) - Number(a.reliability_score || a.consistency_score || 0);
+        })
+        .slice(0, 4);
+    },
+    query() {
+      const p = new URLSearchParams();
+      Object.entries(this.filters).forEach(([k, v]) => {
+        if (v === '' || v === null || v === undefined || v === false) return;
+        p.set(k, v);
+      });
+      return p.toString();
+    },
+    async fetchJson(url, options = {}) {
+      const res = await fetch(url, {credentials: 'same-origin', ...options});
+      const data = await res.json();
+      if (!res.ok || data.ok === false) throw new Error(data.error || res.statusText);
+      return data;
+    },
+    async loadAll() {
+      this.loading = true;
+      try {
+        await Promise.all([this.loadTop(), this.loadFavorites()]);
+      } finally {
+        this.loading = false;
+      }
+    },
+    async loadTop() {
+      const data = await this.fetchJson('/api/radar/top?' + this.query());
+      this.top = (data.items || []).map((row, idx) => ({...row, _rank: idx + 1}));
+      if (!this.detail.latest && this.top.length) this.select(this.top[0].symbol);
+    },
+    async loadFavorites() {
+      const data = await this.fetchJson('/api/radar/favorites');
+      this.favorites = data.items || [];
+    },
+    async select(symbol) {
+      const data = await this.fetchJson('/api/radar/token/' + encodeURIComponent(symbol));
+      this.detail = data;
+    },
+    async addFav(symbol) {
+      await this.fetchJson('/api/radar/favorites', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({symbol}),
+      });
+      await this.loadFavorites();
+    },
+    async removeFav(symbol) {
+      await this.fetchJson('/api/radar/favorites/' + encodeURIComponent(symbol), {method: 'DELETE'});
+      await this.loadFavorites();
+    },
+    summaryText() {
+      if (this.top.length) return 'Dernier snapshot: ' + this.shortDate(this.top[0].created_at);
+      return 'En attente de scan';
+    },
+    fmt(v, d = 2) { return Number.isFinite(Number(v)) ? Number(v).toFixed(d) : '—'; },
+    price(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '—';
+      if (n >= 100) return n.toFixed(2);
+      if (n >= 1) return n.toFixed(4);
+      return n.toPrecision(6);
+    },
+    pct(v) {
+      const n = Number(v);
+      return Number.isFinite(n) ? (n * 100).toFixed(2) + '%' : '—';
+    },
+    compact(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '—';
+      if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+      if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+      if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+      return n.toFixed(0);
+    },
+    pctClass(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n) || Math.abs(n) < 0.00001) return 'neutral';
+      return n > 0 ? 'profit' : 'loss';
+    },
+    amplitudeClass(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return 'neutral';
+      if (n >= 0.08) return 'warn';
+      if (n >= 0.03) return 'warn';
+      return 'neutral';
+    },
+    negativeClass(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n) || n < 25) return 'neutral';
+      if (n >= 60) return 'loss';
+      return 'warn';
+    },
+    scoreClass(v) {
+      const n = Number(v);
+      if (n >= 75) return 'strong';
+      if (n >= 55) return 'watch';
+      return 'weak';
+    },
+    scoreValue(row) {
+      if (!row) return null;
+      return row.score ?? row.global_score;
+    },
+    amplitudeValue(row) {
+      if (!row) return null;
+      return row.amplitude_pct ?? row.volatility_pct;
+    },
+    riskText(row) {
+      if (!row) return '—';
+      return row.risk_label || row.risk_level || '—';
+    },
+    riskClass(level) {
+      const value = String(level || '').toLowerCase();
+      if (value === 'low') return 'low';
+      if (value === 'medium') return 'medium';
+      if (value === 'high') return 'high';
+      if (value === 'extreme') return 'extreme';
+      return 'medium';
+    },
+    reasonText(row) {
+      if (!row) return '—';
+      return row.reason || row.risk_reason || '—';
+    },
+    sortBy(key) {
+      if (this.sort.key === key) {
+        this.sort.dir = this.sort.dir === 'asc' ? 'desc' : 'asc';
+      } else {
+        this.sort.key = key;
+        this.sort.dir = ['rank', 'symbol', 'spread'].includes(key) ? 'asc' : 'desc';
+      }
+    },
+    sortMark(key) {
+      if (this.sort.key !== key) return '';
+      return this.sort.dir === 'asc' ? '↑' : '↓';
+    },
+    compareRows(a, b, key) {
+      const field = this.sortMap[key] || key;
+      const av = key === 'score' ? this.scoreValue(a) : a[field];
+      const bv = key === 'score' ? this.scoreValue(b) : b[field];
+      if (key === 'volatility') {
+        const aa = Number(this.amplitudeValue(a));
+        const bb = Number(this.amplitudeValue(b));
+        return aa === bb ? 0 : aa > bb ? 1 : -1;
+      }
+      const an = Number(av);
+      const bn = Number(bv);
+      if (Number.isFinite(an) && Number.isFinite(bn)) return an === bn ? 0 : an > bn ? 1 : -1;
+      return String(av ?? '').localeCompare(String(bv ?? ''), 'fr', {numeric: true, sensitivity: 'base'});
+    },
+    perfSinceAdd(fav) {
+      const added = Number(fav.added_price);
+      const current = Number(fav.current_price);
+      if (!added || !current) return '—';
+      return this.pct((current - added) / added);
+    },
+    shortDate(raw) {
+      if (!raw) return '—';
+      const d = new Date(raw);
+      if (Number.isNaN(d.getTime())) return raw;
+      return d.toLocaleString('fr-FR', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
+    },
+  };
+}
+</script>
+{% endblock %}
