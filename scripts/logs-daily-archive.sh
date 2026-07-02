@@ -26,8 +26,8 @@ fi
 journalctl -u kraken-aifout-bot.service --since "24 hours ago" --no-pager \
   | gzip > "${RUNTIME_DIR}/kraken-aifout-bot-${TS}.log.gz"
 
-journalctl -u token-profile-selector.service --since "24 hours ago" --no-pager \
-  | gzip > "${RUNTIME_DIR}/token-profile-selector-${TS}.log.gz"
+journalctl -u kraken-token-profile-selector.service --since "24 hours ago" --no-pager \
+  | gzip > "${RUNTIME_DIR}/kraken-token-profile-selector-${TS}.log.gz"
 
 if [ -d "${LOGS_DIR}" ] && [ "$(ls -A "${LOGS_DIR}" 2>/dev/null || true)" ]; then
   tar -czf "${LOGS_ARCHIVE_DIR}/logs-${TS}.tar.gz" -C "${DATA_DIR}" logs

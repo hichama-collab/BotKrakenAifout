@@ -8,22 +8,32 @@ rm -f "$OUT"
 cd "$ROOT"
 
 zip -r "$OUT" . \
+  -x ".git" \
   -x ".git/*" \
+  -x ".venv" \
+  -x ".venv/*" \
+  -x "__pycache__" \
+  -x "__pycache__/*" \
+  -x "*/__pycache__" \
+  -x "*/__pycache__/*" \
+  -x ".pytest_cache" \
+  -x ".pytest_cache/*" \
+  -x "data/logs" \
+  -x "data/logs/*" \
+  -x "data/runtime" \
+  -x "data/runtime/*" \
+  -x "data/*.sqlite3" \
+  -x "data/**/*.sqlite3" \
+  -x "*.pyc" \
   -x ".env" \
   -x ".service.env" \
+  -x "ip.txt" \
   -x ".btc_range.env" \
   -x ".btc_range_dash.env" \
   -x "dashboard/botdash.env" \
   -x "config/.service.env" \
-  -x "data/runtime/*" \
-  -x "data/logs/*" \
   -x "logs/*" \
-  -x "__pycache__/*" \
-  -x "*/__pycache__/*" \
-  -x ".pytest_cache/*" \
   -x "venv/*" \
-  -x ".venv/*" \
-  -x "*.pyc" \
   -x "*.pyo"
 
 echo "Created $OUT"

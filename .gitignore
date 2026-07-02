@@ -30,6 +30,7 @@ htmlcov/
 .service.env
 config/.service.env
 dashboard/botdash.env
+ip.txt
 venv.txt
 
 # Generated bot runtime data

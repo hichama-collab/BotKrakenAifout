@@ -14,5 +14,8 @@ source .venv/bin/activate
 
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+if [ -f dashboard/requirements.txt ]; then
+  python -m pip install -r dashboard/requirements.txt
+fi
 
-echo "OK: venv ready (.venv) and dependencies installed"
+echo "OK: venv ready (.venv), bot dependencies installed, dashboard dependencies installed"
