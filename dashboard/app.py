@@ -43,6 +43,7 @@ DASH_USER = os.environ.get("DASH_USER", "admin")
 DASH_PASS = os.environ.get("DASH_PASS", "changeme")
 BOT_DASHBOARD_TOKEN = os.environ.get("BOT_DASHBOARD_TOKEN", "")
 DASH_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY") or os.environ.get("SECRET_KEY", "")
+DASH_SERVICE_NAME = os.environ.get("DASH_SERVICE_NAME", "kraken-botdash.service")
 
 if DASH_PASS in ("", "changeme"):
     raise RuntimeError("DASH_PASS must be changed")
@@ -416,13 +417,13 @@ _bg_sync_loop()
 
 SERVICES = [
     "kraken-aifout-bot.service",
-    "botdash.service",
+    DASH_SERVICE_NAME,
     "kraken-token-profile-selector.service",
     "kraken-token-profile-selector.timer",
 ]
 ALLOWED_CONTROL_UNITS = {
     "kraken-aifout-bot.service",
-    "botdash.service",
+    DASH_SERVICE_NAME,
 }
 
 # ---------------------------------------------------------------------------

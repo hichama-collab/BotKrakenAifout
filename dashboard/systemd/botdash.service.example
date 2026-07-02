@@ -1,6 +1,6 @@
 # === FILE: dashboard/systemd/botdash.service.example ===
-# Copy to /etc/systemd/system/botdash.service
-# Then: systemctl daemon-reload && systemctl enable --now botdash.service
+# Copy to /etc/systemd/system/kraken-botdash.service
+# Then: systemctl daemon-reload && systemctl enable --now kraken-botdash.service
 
 [Unit]
 Description=Kraken AiFout Bot Dashboard
@@ -9,8 +9,8 @@ Wants=network.target
 
 [Service]
 Type=simple
-User=botuser
-Group=botuser
+User=root
+Group=root
 WorkingDirectory=/opt/kraken-aifout-bot/dashboard
 EnvironmentFile=/opt/kraken-aifout-bot/dashboard/botdash.env
 ExecStart=/opt/kraken-aifout-bot/.venv/bin/python app.py
