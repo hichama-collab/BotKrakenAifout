@@ -985,12 +985,25 @@ td.num, th.num {
 }
 
 .topbar-logo {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.55rem;
   font-size: 1.1rem;
   font-weight: 800;
   color: var(--color-accent);
-  letter-spacing: -0.02em;
+  letter-spacing: 0;
   text-decoration: none;
   flex-shrink: 0;
+  min-width: 0;
+}
+
+.topbar-logo-mark {
+  width: 2rem;
+  height: 2rem;
+  border-radius: 0.35rem;
+  object-fit: cover;
+  object-position: center;
+  display: block;
 }
 
 .topbar-logo span {
@@ -2139,6 +2152,12 @@ td.num, th.num {
 
   .topbar-logo {
     font-size: 0.86rem;
+  }
+
+  .topbar-logo-mark {
+    width: 1.65rem;
+    height: 1.65rem;
+    border-radius: 0.3rem;
   }
 
   .topbar .btn-icon {
