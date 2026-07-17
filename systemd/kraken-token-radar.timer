@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Kraken token radar scan every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=kraken-token-radar.service
+
+[Install]
+WantedBy=timers.target

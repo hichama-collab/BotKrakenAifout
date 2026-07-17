@@ -1,0 +1,14 @@
+[Unit]
+Description=Kraken token radar scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/kraken-aifout-bot
+EnvironmentFile=-/opt/kraken-aifout-bot/.env
+EnvironmentFile=-/opt/kraken-aifout-bot/.service.env
+ExecStart=/opt/kraken-aifout-bot/.venv/bin/python /opt/kraken-aifout-bot/tools/token_radar_scan.py
+User=root
+Group=root
+Nice=5

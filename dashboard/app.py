@@ -418,6 +418,8 @@ _bg_sync_loop()
 SERVICES = [
     "kraken-aifout-bot.service",
     DASH_SERVICE_NAME,
+    "kraken-token-radar.service",
+    "kraken-token-radar.timer",
     "kraken-token-profile-selector.service",
     "kraken-token-profile-selector.timer",
 ]
