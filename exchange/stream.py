@@ -28,11 +28,19 @@ class Stream:
     def _ws_symbol(self) -> str:
         if self.mapper is not None:
             try:
-                return self.mapper.resolve_pair(self.symbol).ws_symbol
+                return self._v2_symbol(self.mapper.resolve_pair(self.symbol).ws_symbol)
             except Exception:
                 pass
         s = str(self.symbol).upper().replace("-", "/").replace("_", "/")
-        return s if "/" in s else s.replace("BTC", "XBT", 1).replace("USDC", "/USDC")
+        return self._v2_symbol(s if "/" in s else s.replace("USDC", "/USDC"))
+
+    @staticmethod
+    def _v2_symbol(symbol: str) -> str:
+        """Kraken REST/AssetPairs may expose XBT, while WS v2 ticker expects BTC."""
+        s = str(symbol or "").upper().replace("-", "/").replace("_", "/")
+        if s.startswith("XBT/"):
+            return "BTC/" + s.split("/", 1)[1]
+        return s
 
     def _make_ws(self):
         return websocket.WebSocketApp(
