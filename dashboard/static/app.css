@@ -651,6 +651,20 @@ td.num, th.num {
   text-decoration: underline;
 }
 
+.exchange-symbol-link {
+  color: var(--color-text-primary);
+  font-family: var(--font-mono);
+  font-weight: 800;
+  text-decoration: none;
+  text-underline-offset: 0.18em;
+}
+
+.exchange-symbol-link:hover,
+.exchange-symbol-link:focus-visible {
+  color: var(--color-accent);
+  text-decoration: underline;
+}
+
 /* =========================================================
    10. Chart Container
    ========================================================= */

@@ -48,7 +48,11 @@
       <div class="control-summary">
         <div class="control-kv">
           <span>Token</span>
-          <strong class="font-mono" x-text="control.symbol || '—'"></strong>
+          <a class="font-mono exchange-symbol-link"
+             :href="krakenUrl(control.symbol)"
+             target="_blank"
+             rel="noopener noreferrer"
+             x-text="control.symbol || '—'"></a>
         </div>
         <div class="control-kv">
           <span>Profile</span>

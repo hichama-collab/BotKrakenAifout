@@ -23,8 +23,11 @@
     </div>
     <div class="pick-grid">
       <template x-for="row in picks" :key="row.symbol">
-        <button class="pick-card" @click="select(row.symbol)">
-          <span class="pick-symbol" x-text="row.symbol"></span>
+        <article class="pick-card" role="button" tabindex="0"
+                 @click="select(row.symbol)" @keydown.enter="select(row.symbol)">
+          <a class="pick-symbol exchange-symbol-link"
+             :href="krakenUrl(row.symbol)" target="_blank" rel="noopener noreferrer"
+             @click.stop x-text="row.symbol"></a>
           <span class="pick-score" x-text="fmt(scoreValue(row), 1)"></span>
           <span :class="'risk-badge ' + riskClass(row.risk_level)" x-text="riskText(row)"></span>
           <span class="pick-line">
@@ -34,7 +37,7 @@
             <em x-show="Number(row.negative_pressure_score || 0) >= 25" x-text="'Neg ' + fmt(row.negative_pressure_score, 0)"></em>
           </span>
           <small x-text="row.reason || row.risk_reason"></small>
-        </button>
+        </article>
       </template>
       <div x-show="!picks.length" class="empty">Aucune selection stable pour le moment</div>
     </div>
@@ -114,7 +117,9 @@
             <template x-for="(row, idx) in sortedTop" :key="row.symbol">
               <tr @click="select(row.symbol)">
                 <td class="muted" x-text="row._rank || idx + 1"></td>
-                <td><strong x-text="row.symbol"></strong></td>
+                <td><a class="exchange-symbol-link"
+                       :href="krakenUrl(row.symbol)" target="_blank" rel="noopener noreferrer"
+                       @click.stop x-text="row.symbol"></a></td>
                 <td class="num" x-text="price(row.price)"></td>
                 <td><span class="score-pill" :class="scoreClass(scoreValue(row))" x-text="fmt(scoreValue(row), 1)"></span></td>
                 <td><span class="score-pill hot-pill" x-text="fmt(row.hot_score, 0)"></span></td>
@@ -155,7 +160,9 @@
         <template x-for="fav in favorites" :key="fav.symbol">
           <div class="favorite-row" @click="select(fav.symbol)">
             <div>
-              <strong x-text="fav.symbol"></strong>
+              <a class="exchange-symbol-link"
+                 :href="krakenUrl(fav.symbol)" target="_blank" rel="noopener noreferrer"
+                 @click.stop x-text="fav.symbol"></a>
               <span x-text="fav.last_signal || 'WATCH'"></span>
             </div>
             <div class="favorite-metrics">
@@ -170,7 +177,9 @@
 
       <div class="token-detail" x-show="detail.latest">
         <div class="radar-panel-title">
-          <h2 x-text="detail.symbol"></h2>
+          <h2><a class="exchange-symbol-link"
+                 :href="krakenUrl(detail.symbol)" target="_blank" rel="noopener noreferrer"
+                 x-text="detail.symbol"></a></h2>
           <span x-text="detail.latest ? detail.latest.signal : ''"></span>
         </div>
         <div class="detail-grid" x-show="detail.latest">
@@ -419,6 +428,11 @@ function tokenRadar() {
       const d = new Date(raw);
       if (Number.isNaN(d.getTime())) return raw;
       return d.toLocaleString('fr-FR', {day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit'});
+    },
+    krakenUrl(symbol) {
+      const normalized = String(symbol || '').trim().toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const pair = normalized.endsWith('USDC') ? normalized.slice(0, -4) + '-USDC' : normalized;
+      return 'https://pro.kraken.com/app/trade/' + pair.toLowerCase();
     },
   };
 }

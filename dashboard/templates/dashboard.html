@@ -29,7 +29,11 @@
       <div class="live-symbol">
         <span class="market-dot" :class="botStatus === 'active' ? 'is-live' : 'is-off'"></span>
         <div>
-          <strong x-text="fmtSymbol(activeToken) || '—'"></strong>
+          <a class="exchange-symbol-link"
+             :href="krakenUrl(activeToken)"
+             target="_blank"
+             rel="noopener noreferrer"
+             x-text="activeToken || '—'"></a>
           <span>
             <span x-text="profile"></span>
             <span> · </span>

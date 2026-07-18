@@ -88,6 +88,17 @@ function colorClass(value) {
   return value > 0 ? 'profit' : 'loss';
 }
 
+function krakenTradeUrl(symbol) {
+  const normalized = String(symbol || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+  const pair = normalized.endsWith('USDC')
+    ? `${normalized.slice(0, -4)}-USDC`
+    : normalized;
+  return `https://pro.kraken.com/app/trade/${pair.toLowerCase()}`;
+}
+
 function signedColor(value) {
   if (value > 0) return '#36C991';
   if (value < 0) return '#EC6A7A';
@@ -585,8 +596,7 @@ function botDashboard() {
       return `${Math.floor(v / 3600)}h ${Math.floor((v % 3600) / 60)}m`;
     },
     krakenUrl(sym) {
-      const base = fmt.symbol(sym || '');
-      return `https://pro.kraken.com/app/trade/spot/${base}-USDC`;
+      return krakenTradeUrl(sym);
     },
     signedColor,
   };
@@ -730,8 +740,7 @@ function botStats() {
     fmtPrice(v) { return fmt.price(v); },
     fmtReason(v) { return formatReason(v); },
     krakenUrl(sym) {
-      const base = fmt.symbol(sym || '');
-      return `https://pro.kraken.com/app/trade/spot/${base}-USDC`;
+      return krakenTradeUrl(sym);
     },
   };
 }
@@ -752,6 +761,7 @@ function botServices() {
     error: null,
     actionLog: [],
     actionInProgress: {},
+    krakenUrl(sym) { return krakenTradeUrl(sym); },
 
     // Confirm modal state
     modal: {
