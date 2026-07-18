@@ -36,10 +36,12 @@ class Stream:
 
     @staticmethod
     def _v2_symbol(symbol: str) -> str:
-        """Kraken REST/AssetPairs may expose XBT, while WS v2 ticker expects BTC."""
+        """Kraken REST/AssetPairs may expose legacy assets while WS v2 uses modern names."""
         s = str(symbol or "").upper().replace("-", "/").replace("_", "/")
         if s.startswith("XBT/"):
             return "BTC/" + s.split("/", 1)[1]
+        if s.startswith("XDG/"):
+            return "DOGE/" + s.split("/", 1)[1]
         return s
 
     def _make_ws(self):

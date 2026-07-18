@@ -47,6 +47,9 @@ SELECTOR_UNKNOWN_SCORE_PENALTY = float(os.getenv("SELECTOR_UNKNOWN_SCORE_PENALTY
 SELECTOR_RESPECT_WALLET_POSITION = os.getenv("SELECTOR_RESPECT_WALLET_POSITION", "1") != "0"
 SELECTOR_RUNTIME_LOCK_MAX_AGE_SEC = float(os.getenv("SELECTOR_RUNTIME_LOCK_MAX_AGE_SEC", "300"))
 SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT = float(os.getenv("SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT", "0.0020"))
+SELECTOR_TOP_MOVER_FALLBACK = os.getenv("SELECTOR_TOP_MOVER_FALLBACK", "1") != "0"
+SELECTOR_RESTART_BOT_ON_CHANGE = os.getenv("SELECTOR_RESTART_BOT_ON_CHANGE", "1") != "0"
+BOT_SERVICE_NAME = os.getenv("BOT_SERVICE_NAME", "kraken-aifout-bot.service")
 DEFAULT_PROFILE = (os.getenv("SELECTOR_PROFILE", "strict") or "strict").strip()
 
 
@@ -407,6 +410,43 @@ def collect_candidates(excluded_symbols: set[str] | None = None, positive_only: 
     return candidates
 
 
+def collect_top_movers(excluded_symbols: set[str] | None = None, positive_only: bool = True):
+    symbols = get_symbols_usdc_trading()
+    spread_map = get_spread_map()
+    market_map = get_market_stats_map()
+    excluded_symbols = {str(sym).strip().upper() for sym in (excluded_symbols or set()) if str(sym).strip()}
+    candidates = []
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        future_to_symbol = {
+            pool.submit(change_window_pct, sym): sym
+            for sym in symbols
+            if sym not in excluded_symbols and _base_asset(sym) not in EXCLUDED_BASE_ASSETS
+        }
+        for future in as_completed(future_to_symbol):
+            sym = future_to_symbol[future]
+            try:
+                pct = future.result()
+            except Exception:
+                continue
+            if pct is None:
+                continue
+            if positive_only and pct <= 0:
+                continue
+            market = market_map.get(sym) or {}
+            candidates.append({
+                "symbol": sym,
+                "pct": pct,
+                "spread_pct": float(spread_map.get(sym, 0.0)) * 100.0,
+                "last_price": float(market.get("last_price") or 0.0),
+                "quote_volume_24h": float(market.get("quote_volume_24h") or 0.0),
+                "trade_count_24h": int(market.get("trade_count_24h") or 0),
+                "change_pct_24h": float(market.get("change_pct_24h") or 0.0),
+            })
+    candidates.sort(key=lambda item: (item["pct"], -item["spread_pct"], item["symbol"]), reverse=True)
+    return candidates
+
+
 def rank_candidates(candidates, score_map, quality_map=None):
     min_qs = float(os.getenv("SELECTOR_MIN_QUALITY_SCORE", "0.3"))
     respect_blocked = os.getenv("SELECTOR_RESPECT_BLOCKED", "1") != "0"
@@ -510,6 +550,38 @@ def choose_fallback_candidate(score_map, excluded_symbols: set[str] | None = Non
 
     return fallback, fallback_mode, positive_ranked, any_ranked
 
+
+def choose_top_mover_fallback(excluded_symbols: set[str] | None = None, quality_map=None):
+    if not SELECTOR_TOP_MOVER_FALLBACK:
+        return None, []
+    candidates = collect_top_movers(excluded_symbols=excluded_symbols, positive_only=True)
+    respect_blocked = os.getenv("SELECTOR_RESPECT_BLOCKED", "1") != "0"
+    ranked = []
+    for item in candidates:
+        tok = (quality_map or {}).get(item["symbol"], {})
+        if respect_blocked and float(tok.get("quality_score", 0.5)) == 0.0:
+            print(
+                f"TOKEN_SELECTOR: top_mover skip {item['symbol']} "
+                f"quality_score=0.0 reason={tok.get('block_reason','')}"
+            )
+            continue
+        ranked.append({
+            **item,
+            "final_score": float(item["pct"]),
+            "raw_score": float(item["pct"]),
+            "quality_score": float(tok.get("quality_score", 0.5)),
+            "history_bonus": 0.0,
+            "unknown_penalty": 0.0,
+            "is_toxic": False,
+            "toxic_reasons": "",
+            "closed_trades": 0,
+            "winrate_5": None,
+            "pnl_usdc_5": None,
+            "avg_pnl_pct_5": None,
+        })
+    ranked.sort(key=lambda item: (item["pct"], -item["spread_pct"], item["symbol"]), reverse=True)
+    return (ranked[0] if ranked else None), ranked
+
 def log_selector_memory_state(sync_info, ranked):
     print(
         "TOKEN_SELECTOR: memory "
@@ -579,6 +651,35 @@ def write_service_env(symbol: str, pct: float, profile: str):
         f"SYMBOL={symbol} VAR{WINDOW_MINUTES}M={pct:.2f}% MAX_SPREAD={SELECTOR_MAX_SPREAD_PCT*100:.2f}% "
         f"PROFILE={env_now.get('PROFILE', profile)} DRY_RUN={env_now.get('DRY_RUN','')} QUOTE={QUOTE_ASSET}"
     )
+
+
+def restart_bot_if_symbol_changed(previous_symbol: str, new_symbol: str):
+    if not SELECTOR_RESTART_BOT_ON_CHANGE:
+        return
+    previous = (previous_symbol or "").strip().upper()
+    new = (new_symbol or "").strip().upper()
+    if not new or previous == new:
+        return
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["systemctl", "restart", BOT_SERVICE_NAME],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        ok = result.returncode == 0
+        output = (result.stdout or result.stderr or "").strip()
+        print(
+            f"TOKEN_SELECTOR: bot restart requested service={BOT_SERVICE_NAME} "
+            f"symbol={previous or '-'}->{new} ok={int(ok)} output={output[:200]}"
+        )
+    except Exception as e:
+        print(
+            f"TOKEN_SELECTOR: bot restart failed service={BOT_SERVICE_NAME} "
+            f"symbol={previous or '-'}->{new} err={e}"
+        )
+
 
 def main():
     env_now = _read_env_file(SERVICE_ENV_PATH)
@@ -651,7 +752,27 @@ def main():
                     f"var={fallback['pct']:.2f}% toxic={int(bool(fallback.get('is_toxic')))}"
                 )
                 write_service_env(fallback["symbol"], fallback["pct"], DEFAULT_PROFILE)
+                restart_bot_if_symbol_changed(current_symbol, fallback["symbol"])
                 return 0
+        top_mover, top_ranked = choose_top_mover_fallback(
+            excluded_symbols=blocked_symbols,
+            quality_map=quality_map,
+        )
+        if top_mover:
+            log_selector_memory_state(sync_info, top_ranked)
+            print(
+                f"TOKEN_SELECTOR: top_mover_fallback selected {top_mover['symbol']} "
+                f"var={top_mover['pct']:.2f}% strict_reason=no_eligible_positive "
+                f"window={WINDOW_MINUTES}m qv24h={top_mover.get('quote_volume_24h', 0.0):.0f} "
+                f"spread={top_mover.get('spread_pct', 0.0):.3f}%"
+            )
+            write_service_env(top_mover["symbol"], top_mover["pct"], DEFAULT_PROFILE)
+            restart_bot_if_symbol_changed(current_symbol, top_mover["symbol"])
+            _save_selector_state({
+                "last_switch_ts": time.time(),
+                "last_switch_symbol": top_mover["symbol"],
+            })
+            return 0
         print(
             f"TOKEN_SELECTOR: no eligible positive {QUOTE_ASSET} symbol found "
             f"({WINDOW_MINUTES}m window, max_spread={SELECTOR_MAX_SPREAD_PCT*100:.2f}% "
@@ -694,6 +815,7 @@ def main():
         )
         current_score = current_in_ranked["final_score"] if current_in_ranked else 0.0
         write_service_env(current_symbol, current_score, DEFAULT_PROFILE)
+        restart_bot_if_symbol_changed(current_symbol, current_symbol)
         return 0
     if current_is_flat and is_new_token:
         print(
@@ -717,6 +839,7 @@ def main():
                 f"delta={score_delta:+.3f} < {SELECTOR_HYSTERESIS_PCT} — no switch"
             )
             write_service_env(current_symbol, current_score, DEFAULT_PROFILE)
+            restart_bot_if_symbol_changed(current_symbol, current_symbol)
             return 0
         print(
             f"TOKEN_SELECTOR: early switch authorized "
@@ -731,6 +854,7 @@ def main():
         f"trades24h={chosen.get('trade_count_24h', 0)}"
     )
     write_service_env(chosen["symbol"], chosen["pct"], DEFAULT_PROFILE)
+    restart_bot_if_symbol_changed(current_symbol, chosen["symbol"])
     if is_new_token or not last_switch_ts:
         _save_selector_state({
             "last_switch_ts": time.time(),

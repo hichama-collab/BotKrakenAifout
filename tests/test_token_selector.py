@@ -64,6 +64,21 @@ class CandidateWindowTests(unittest.TestCase):
         ):
             self.assertTrue(selector._candidate_window_is_eligible(0.30, 0.05))
 
+    def test_top_mover_fallback_selects_highest_positive_variation(self):
+        movers = [
+            {"symbol": "ETHUSDC", "pct": 0.10, "spread_pct": 0.01},
+            {"symbol": "VIRTUALUSDC", "pct": 2.42, "spread_pct": 0.15},
+            {"symbol": "BTCUSDC", "pct": 0.13, "spread_pct": 0.01},
+        ]
+        with (
+            patch.object(selector, "SELECTOR_TOP_MOVER_FALLBACK", True),
+            patch.object(selector, "collect_top_movers", return_value=movers),
+        ):
+            chosen, ranked = selector.choose_top_mover_fallback(set(), {})
+
+        self.assertEqual(chosen["symbol"], "VIRTUALUSDC")
+        self.assertEqual([item["symbol"] for item in ranked], ["VIRTUALUSDC", "BTCUSDC", "ETHUSDC"])
+
 
 class RecentHighFilterTests(unittest.TestCase):
     def test_distance_from_recent_high_pct(self):
