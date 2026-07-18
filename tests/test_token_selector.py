@@ -21,6 +21,25 @@ class FlatTokenHoldTests(unittest.TestCase):
 
 
 class CandidateWindowTests(unittest.TestCase):
+    def test_change_window_uses_only_requested_recent_candles(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [
+                    [0, "50", "51", "49", "50", "0"],
+                    [0, "90", "91", "89", "90", "0"],
+                    [0, "100", "101", "99", "100", "0"],
+                    [0, "100", "102", "99", "101", "0"],
+                ]
+
+        with patch.object(selector._SESSION, "get", return_value=Response()):
+            self.assertAlmostEqual(
+                selector.change_window_pct("BTCUSDC", minutes=2),
+                1.0,
+            )
+
     def test_rejects_micro_move(self):
         with (
             patch.object(selector, "SELECTOR_MIN_WINDOW_PCT", 0.15),
@@ -54,6 +73,7 @@ class RecentHighFilterTests(unittest.TestCase):
 
             def json(self):
                 return [
+                    [0, "100", "999", "99", "100", "0"],
                     [0, "100", "101", "99", "100", "0"],
                     [0, "100", "102", "99", "101", "0"],
                     [0, "101", "103", "100", "102", "0"],

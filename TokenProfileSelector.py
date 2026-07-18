@@ -276,8 +276,9 @@ def change_window_pct(symbol: str, minutes: int = WINDOW_MINUTES):
         k = (data or {}).get(pair) or next((v for k, v in (data or {}).items() if k != "last"), [])
     if not isinstance(k, list) or len(k) < limit:
         return None
-    o = float(k[0][1])
-    c = float(k[-1][4])
+    window = k[-limit:]
+    o = float(window[0][1])
+    c = float(window[-1][4])
     if o <= 0:
         return None
     return (c - o) / o * 100.0
@@ -303,8 +304,9 @@ def distance_from_recent_high_pct(symbol: str, minutes: int = 5) -> float | None
             k = (data or {}).get(pair) or next((v for k, v in (data or {}).items() if k != "last"), [])
         if not isinstance(k, list) or len(k) < 2:
             return None
-        highs = [float(row[2]) for row in k]
-        last = float(k[-1][4])
+        window = k[-limit:]
+        highs = [float(row[2]) for row in window]
+        last = float(window[-1][4])
         high = max(highs)
         if high <= 0:
             return None
