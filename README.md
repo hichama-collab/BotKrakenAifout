@@ -29,6 +29,8 @@ KRAKEN_API_KEY=
 KRAKEN_API_SECRET=
 KRAKEN_BASE_URL=https://api.kraken.com
 KRAKEN_WS_URL=wss://ws.kraken.com/v2
+KRAKEN_WS_CHANNEL=book
+KRAKEN_WS_BOOK_DEPTH=10
 KRAKEN_ENV=spot
 ```
 

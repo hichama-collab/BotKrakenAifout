@@ -95,6 +95,8 @@ class Config:
 
     baseUrl: str = "https://api.kraken.com"
     wsUrl: str = "wss://ws.kraken.com/v2"
+    wsChannel: str = "book"
+    wsBookDepth: int = 10
     krakenEnv: str = "spot"
     quoteAsset: str = "USDC"
 
@@ -334,6 +336,11 @@ def loadConfig() -> Config:
     apiSecret = os.getenv("KRAKEN_API_SECRET", "")
     base_url = os.getenv("KRAKEN_BASE_URL", "https://api.kraken.com").strip() or "https://api.kraken.com"
     ws_url = os.getenv("KRAKEN_WS_URL", "wss://ws.kraken.com/v2").strip() or "wss://ws.kraken.com/v2"
+    ws_channel = os.getenv("KRAKEN_WS_CHANNEL", "book").strip().lower() or "book"
+    try:
+        ws_book_depth = int(os.getenv("KRAKEN_WS_BOOK_DEPTH", "10") or "10")
+    except ValueError:
+        ws_book_depth = 10
     kraken_env = os.getenv("KRAKEN_ENV", "spot").strip().lower() or "spot"
     quote_asset = os.getenv("QUOTE_ASSET", "USDC").strip().upper() or "USDC"
     if not dry and (not apiKey or not apiSecret):
@@ -347,6 +354,8 @@ def loadConfig() -> Config:
         apiSecret=apiSecret,
         baseUrl=base_url,
         wsUrl=ws_url,
+        wsChannel=ws_channel,
+        wsBookDepth=ws_book_depth,
         krakenEnv=kraken_env,
         quoteAsset=quote_asset,
         dryRun=dry,

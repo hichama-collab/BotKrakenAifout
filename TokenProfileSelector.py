@@ -47,7 +47,9 @@ SELECTOR_UNKNOWN_SCORE_PENALTY = float(os.getenv("SELECTOR_UNKNOWN_SCORE_PENALTY
 SELECTOR_RESPECT_WALLET_POSITION = os.getenv("SELECTOR_RESPECT_WALLET_POSITION", "1") != "0"
 SELECTOR_RUNTIME_LOCK_MAX_AGE_SEC = float(os.getenv("SELECTOR_RUNTIME_LOCK_MAX_AGE_SEC", "300"))
 SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT = float(os.getenv("SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT", "0.0020"))
-SELECTOR_TOP_MOVER_FALLBACK = os.getenv("SELECTOR_TOP_MOVER_FALLBACK", "1") != "0"
+# A raw top-mover fallback previously bypassed the tradability gates below and
+# restarted the bot every two minutes on negligible moves. Keep it opt-in only.
+SELECTOR_TOP_MOVER_FALLBACK = os.getenv("SELECTOR_TOP_MOVER_FALLBACK", "0") != "0"
 SELECTOR_RESTART_BOT_ON_CHANGE = os.getenv("SELECTOR_RESTART_BOT_ON_CHANGE", "1") != "0"
 BOT_SERVICE_NAME = os.getenv("BOT_SERVICE_NAME", "kraken-aifout-bot.service")
 DEFAULT_PROFILE = (os.getenv("SELECTOR_PROFILE", "strict") or "strict").strip()
@@ -257,11 +259,14 @@ def get_market_stats_map():
             last = float((row.get("c") or [0])[0])
             volume = float((row.get("v") or [0, 0])[-1])
             vwap = float((row.get("p") or [0, 0])[-1] or last)
+            session_open = float(row.get("o") or 0.0)
+            session_change = ((last - session_open) / session_open * 100.0) if session_open > 0 else 0.0
             out[sym] = {
                 "last_price": last,
                 "quote_volume_24h": volume * vwap,
                 "trade_count_24h": int((row.get("t") or [0, 0])[-1] or 0),
-                "change_pct_24h": 0.0,
+                # Kraken's ticker open is the start of the current UTC day.
+                "change_pct_24h": session_change,
             }
         except Exception:
             continue
@@ -411,40 +416,9 @@ def collect_candidates(excluded_symbols: set[str] | None = None, positive_only: 
 
 
 def collect_top_movers(excluded_symbols: set[str] | None = None, positive_only: bool = True):
-    symbols = get_symbols_usdc_trading()
-    spread_map = get_spread_map()
-    market_map = get_market_stats_map()
-    excluded_symbols = {str(sym).strip().upper() for sym in (excluded_symbols or set()) if str(sym).strip()}
-    candidates = []
-
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        future_to_symbol = {
-            pool.submit(change_window_pct, sym): sym
-            for sym in symbols
-            if sym not in excluded_symbols and _base_asset(sym) not in EXCLUDED_BASE_ASSETS
-        }
-        for future in as_completed(future_to_symbol):
-            sym = future_to_symbol[future]
-            try:
-                pct = future.result()
-            except Exception:
-                continue
-            if pct is None:
-                continue
-            if positive_only and pct <= 0:
-                continue
-            market = market_map.get(sym) or {}
-            candidates.append({
-                "symbol": sym,
-                "pct": pct,
-                "spread_pct": float(spread_map.get(sym, 0.0)) * 100.0,
-                "last_price": float(market.get("last_price") or 0.0),
-                "quote_volume_24h": float(market.get("quote_volume_24h") or 0.0),
-                "trade_count_24h": int(market.get("trade_count_24h") or 0),
-                "change_pct_24h": float(market.get("change_pct_24h") or 0.0),
-            })
-    candidates.sort(key=lambda item: (item["pct"], -item["spread_pct"], item["symbol"]), reverse=True)
-    return candidates
+    # A fallback must never relax liquidity, spread, price, or movement gates.
+    # It only changes ranking behaviour after the normal tradable universe is built.
+    return collect_candidates(excluded_symbols=excluded_symbols, positive_only=positive_only)
 
 
 def rank_candidates(candidates, score_map, quality_map=None):
@@ -605,7 +579,7 @@ def log_selector_memory_state(sync_info, ranked):
             f"{toxic}"
         )
 
-def write_service_env(symbol: str, pct: float, profile: str):
+def write_service_env(symbol: str, pct: float, profile: str) -> bool:
     # IMPORTANT: This tool must NOT change DRY_RUN or unrelated keys.
     # It updates SYMBOL and PROFILE in-place inside .service.env.
     existing_txt = ""
@@ -641,8 +615,16 @@ def write_service_env(symbol: str, pct: float, profile: str):
     if not profile_changed:
         new_lines = [f"PROFILE={profile}\n"] + new_lines
 
+    updated_txt = "".join(new_lines)
+    if updated_txt == existing_txt:
+        print(
+            f"TOKEN_SELECTOR: unchanged {SERVICE_ENV_PATH} "
+            f"SYMBOL={symbol} PROFILE={profile} DRY_RUN={_read_env_file(SERVICE_ENV_PATH).get('DRY_RUN','')}"
+        )
+        return False
+
     with open(SERVICE_ENV_PATH, "w", encoding="utf-8") as f:
-        f.writelines(new_lines)
+        f.write(updated_txt)
 
     # Observability only (read-only).
     env_now = _read_env_file(SERVICE_ENV_PATH)
@@ -651,6 +633,7 @@ def write_service_env(symbol: str, pct: float, profile: str):
         f"SYMBOL={symbol} VAR{WINDOW_MINUTES}M={pct:.2f}% MAX_SPREAD={SELECTOR_MAX_SPREAD_PCT*100:.2f}% "
         f"PROFILE={env_now.get('PROFILE', profile)} DRY_RUN={env_now.get('DRY_RUN','')} QUOTE={QUOTE_ASSET}"
     )
+    return True
 
 
 def restart_bot_if_symbol_changed(previous_symbol: str, new_symbol: str):

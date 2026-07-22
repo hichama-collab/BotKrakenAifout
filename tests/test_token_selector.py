@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import TokenProfileSelector as selector
@@ -78,6 +80,53 @@ class CandidateWindowTests(unittest.TestCase):
 
         self.assertEqual(chosen["symbol"], "VIRTUALUSDC")
         self.assertEqual([item["symbol"] for item in ranked], ["VIRTUALUSDC", "BTCUSDC", "ETHUSDC"])
+
+    def test_top_mover_fallback_reuses_tradability_gates(self):
+        expected = [{"symbol": "SOLUSDC", "pct": 0.42, "spread_pct": 0.03}]
+        with patch.object(selector, "collect_candidates", return_value=expected):
+            assert selector.collect_top_movers({"BTCUSDC"}) == expected
+
+
+class KrakenTickerTests(unittest.TestCase):
+    def test_market_stats_uses_kraken_utc_session_open(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "error": [],
+                    "result": {
+                        "BTCUSDC": {
+                            "c": ["110"],
+                            "v": ["1", "2"],
+                            "p": ["100", "105"],
+                            "t": [1, 2],
+                            "o": "100",
+                        }
+                    },
+                }
+
+        with (
+            patch.object(selector, "_PAIR_META", {"BTCUSDC": {"pair_id": "BTCUSDC"}}),
+            patch.object(selector._SESSION, "get", return_value=Response()),
+        ):
+            stats = selector.get_market_stats_map()
+
+        self.assertEqual(stats["BTCUSDC"]["change_pct_24h"], 10.0)
+
+
+class ServiceEnvTests(unittest.TestCase):
+    def test_write_service_env_does_not_rewrite_unchanged_values(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".service.env"
+            env_path.write_text("PROFILE=strict\nSYMBOL=BTCUSDC\nDRY_RUN=0\n", encoding="utf-8")
+            with patch.object(selector, "SERVICE_ENV_PATH", str(env_path)):
+                self.assertFalse(selector.write_service_env("BTCUSDC", 0.2, "strict"))
+            self.assertEqual(
+                env_path.read_text(encoding="utf-8"),
+                "PROFILE=strict\nSYMBOL=BTCUSDC\nDRY_RUN=0\n",
+            )
 
 
 class RecentHighFilterTests(unittest.TestCase):

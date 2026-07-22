@@ -20,10 +20,21 @@ class Stream:
         self.lastUpdate = 0.0
         self.tickSeq = 0
         self.url = str(getattr(cfg, "wsUrl", "wss://ws.kraken.com/v2") or "wss://ws.kraken.com/v2")
+        self.channel = str(getattr(cfg, "wsChannel", "book") or "book").strip().lower()
+        if self.channel not in {"book", "ticker"}:
+            self.channel = "book"
+        try:
+            self.bookDepth = int(getattr(cfg, "wsBookDepth", 10) or 10)
+        except (TypeError, ValueError):
+            self.bookDepth = 10
+        if self.bookDepth not in {10, 25, 100, 500, 1000}:
+            self.bookDepth = 10
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self._bookBids: dict[float, float] = {}
+        self._bookAsks: dict[float, float] = {}
 
     def _ws_symbol(self) -> str:
         if self.mapper is not None:
@@ -54,16 +65,75 @@ class Stream:
         )
 
     def on_open(self, ws):
+        params = {"channel": self.channel, "symbol": [self._ws_symbol()]}
+        if self.channel == "book":
+            params["depth"] = self.bookDepth
         payload = {
             "method": "subscribe",
-            "params": {"channel": "ticker", "symbol": [self._ws_symbol()]},
+            "params": params,
         }
         ws.send(json.dumps(payload))
+
+    def _accept_bid_ask(self, bid: float, ask: float) -> None:
+        if bid <= 0 or ask <= 0 or bid >= ask:
+            return
+        with self._lock:
+            self.bestBid = bid
+            self.bestAsk = ask
+            self.lastUpdate = time.time()
+            self.tickSeq += 1
+
+    @staticmethod
+    def _apply_levels(book: dict[float, float], levels) -> None:
+        for level in levels or []:
+            try:
+                price = float(level.get("price"))
+                qty = float(level.get("qty"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if price <= 0:
+                continue
+            if qty <= 0:
+                book.pop(price, None)
+            else:
+                book[price] = qty
+
+    def _handle_book_message(self, data: dict) -> None:
+        message_type = str(data.get("type") or "").lower()
+        rows = data.get("data") or []
+        if message_type not in {"snapshot", "update"} or not rows:
+            return
+
+        with self._lock:
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                if message_type == "snapshot":
+                    self._bookBids.clear()
+                    self._bookAsks.clear()
+                self._apply_levels(self._bookBids, row.get("bids"))
+                self._apply_levels(self._bookAsks, row.get("asks"))
+
+            if not self._bookBids or not self._bookAsks:
+                return
+            bid = max(self._bookBids)
+            ask = min(self._bookAsks)
+            if bid <= 0 or ask <= 0 or bid >= ask:
+                return
+            self.bestBid = bid
+            self.bestAsk = ask
+            self.lastUpdate = time.time()
+            self.tickSeq += 1
 
     def on_message(self, ws, msg):
         try:
             data = json.loads(msg)
-            if not isinstance(data, dict) or data.get("channel") != "ticker":
+            if not isinstance(data, dict):
+                return
+            if data.get("channel") == "book":
+                self._handle_book_message(data)
+                return
+            if data.get("channel") != "ticker":
                 return
             rows = data.get("data") or []
             if not rows:
@@ -73,14 +143,7 @@ class Stream:
             ask_raw = row.get("ask")
             bid = float(bid_raw[0] if isinstance(bid_raw, list) else bid_raw)
             ask = float(ask_raw[0] if isinstance(ask_raw, list) else ask_raw)
-            now = time.time()
-            if bid <= 0 or ask <= 0:
-                return
-            with self._lock:
-                self.bestBid = bid
-                self.bestAsk = ask
-                self.lastUpdate = now
-                self.tickSeq += 1
+            self._accept_bid_ask(bid, ask)
         except Exception:
             return
 
