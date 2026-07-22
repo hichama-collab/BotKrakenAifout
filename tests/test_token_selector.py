@@ -116,6 +116,36 @@ class KrakenTickerTests(unittest.TestCase):
         self.assertEqual(stats["BTCUSDC"]["change_pct_24h"], 10.0)
 
 
+class TradableAnchorTests(unittest.TestCase):
+    def test_anchor_replaces_only_an_untradable_active_symbol(self):
+        markets = {
+            "BTCUSDC": {
+                "last_price": 100.0,
+                "quote_volume_24h": 9_000_000.0,
+                "trade_count_24h": 10_000,
+                "change_pct_24h": 1.0,
+            },
+            "XMRUSDC": {
+                "last_price": 100.0,
+                "quote_volume_24h": 100_000.0,
+                "trade_count_24h": 100,
+                "change_pct_24h": 1.0,
+            },
+        }
+        with (
+            patch.object(selector, "get_symbols_usdc_trading", return_value=["BTCUSDC", "XMRUSDC"]),
+            patch.object(selector, "get_spread_map", return_value={"BTCUSDC": 0.0001, "XMRUSDC": 0.003}),
+            patch.object(selector, "get_market_stats_map", return_value=markets),
+        ):
+            anchor, current_is_tradable = selector.choose_tradable_anchor("XMRUSDC")
+            no_anchor, btc_is_tradable = selector.choose_tradable_anchor("BTCUSDC")
+
+        self.assertFalse(current_is_tradable)
+        self.assertEqual(anchor["symbol"], "BTCUSDC")
+        self.assertIsNone(no_anchor)
+        self.assertTrue(btc_is_tradable)
+
+
 class ServiceEnvTests(unittest.TestCase):
     def test_write_service_env_does_not_rewrite_unchanged_values(self):
         with tempfile.TemporaryDirectory() as temp_dir:

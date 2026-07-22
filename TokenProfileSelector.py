@@ -272,6 +272,66 @@ def get_market_stats_map():
             continue
     return out
 
+
+def _tradable_symbols(symbols, spread_map, market_map, excluded_symbols: set[str]):
+    filter_counts = {
+        "blocked": 0,
+        "base_excluded": 0,
+        "spread": 0,
+        "market": 0,
+        "price": 0,
+        "quote_volume": 0,
+        "trade_count": 0,
+        "change_24h": 0,
+    }
+    eligible_symbols = []
+    for sym in symbols:
+        if sym in excluded_symbols:
+            filter_counts["blocked"] += 1
+            continue
+        if _base_asset(sym) in EXCLUDED_BASE_ASSETS:
+            filter_counts["base_excluded"] += 1
+            continue
+        spread = spread_map.get(sym)
+        if spread is None or spread > SELECTOR_MAX_SPREAD_PCT:
+            filter_counts["spread"] += 1
+            continue
+        market = market_map.get(sym)
+        if market is None:
+            filter_counts["market"] += 1
+            continue
+        if float(market["last_price"]) < SELECTOR_MIN_PRICE_USDC:
+            filter_counts["price"] += 1
+            continue
+        if float(market["quote_volume_24h"]) < SELECTOR_MIN_QUOTE_VOLUME_USDC_24H:
+            filter_counts["quote_volume"] += 1
+            continue
+        if int(market["trade_count_24h"]) < SELECTOR_MIN_TRADE_COUNT_24H:
+            filter_counts["trade_count"] += 1
+            continue
+        change_24h = float(market["change_pct_24h"])
+        if change_24h < SELECTOR_MIN_24H_CHANGE_PCT or change_24h > SELECTOR_MAX_24H_CHANGE_PCT:
+            filter_counts["change_24h"] += 1
+            continue
+        eligible_symbols.append(sym)
+    return eligible_symbols, filter_counts
+
+
+def _log_tradable_universe(symbols, eligible_symbols, filter_counts) -> None:
+    print(
+        "TOKEN_SELECTOR: universe "
+        f"total={len(symbols)} eligible={len(eligible_symbols)} "
+        f"reject_blocked={filter_counts['blocked']} "
+        f"reject_base={filter_counts['base_excluded']} "
+        f"reject_spread={filter_counts['spread']} reject_market={filter_counts['market']} "
+        f"reject_price={filter_counts['price']} reject_quote_volume={filter_counts['quote_volume']} "
+        f"reject_trade_count={filter_counts['trade_count']} reject_change24h={filter_counts['change_24h']} "
+        f"min_window={SELECTOR_MIN_WINDOW_PCT:.2f}% max_window={SELECTOR_MAX_WINDOW_PCT:.2f}% "
+        f"min_price={SELECTOR_MIN_PRICE_USDC:.4f} "
+        f"min_quote_volume_24h={SELECTOR_MIN_QUOTE_VOLUME_USDC_24H:.0f} "
+        f"min_trade_count_24h={SELECTOR_MIN_TRADE_COUNT_24H}"
+    )
+
 def change_window_pct(symbol: str, minutes: int = WINDOW_MINUTES):
     # klines-based price change over `minutes` 1m candles
     limit = max(2, minutes)
@@ -327,60 +387,10 @@ def collect_candidates(excluded_symbols: set[str] | None = None, positive_only: 
     spread_map = get_spread_map()
     market_map = get_market_stats_map()
     excluded_symbols = {str(sym).strip().upper() for sym in (excluded_symbols or set()) if str(sym).strip()}
-    filter_counts = {
-        "blocked": 0,
-        "base_excluded": 0,
-        "spread": 0,
-        "market": 0,
-        "price": 0,
-        "quote_volume": 0,
-        "trade_count": 0,
-        "change_24h": 0,
-    }
-    eligible_symbols = []
-    for sym in symbols:
-        if sym in excluded_symbols:
-            filter_counts["blocked"] += 1
-            continue
-        if _base_asset(sym) in EXCLUDED_BASE_ASSETS:
-            filter_counts["base_excluded"] += 1
-            continue
-        spread = spread_map.get(sym)
-        if spread is None or spread > SELECTOR_MAX_SPREAD_PCT:
-            filter_counts["spread"] += 1
-            continue
-        market = market_map.get(sym)
-        if market is None:
-            filter_counts["market"] += 1
-            continue
-        if float(market["last_price"]) < SELECTOR_MIN_PRICE_USDC:
-            filter_counts["price"] += 1
-            continue
-        if float(market["quote_volume_24h"]) < SELECTOR_MIN_QUOTE_VOLUME_USDC_24H:
-            filter_counts["quote_volume"] += 1
-            continue
-        if int(market["trade_count_24h"]) < SELECTOR_MIN_TRADE_COUNT_24H:
-            filter_counts["trade_count"] += 1
-            continue
-        change_24h = float(market["change_pct_24h"])
-        if change_24h < SELECTOR_MIN_24H_CHANGE_PCT or change_24h > SELECTOR_MAX_24H_CHANGE_PCT:
-            filter_counts["change_24h"] += 1
-            continue
-        eligible_symbols.append(sym)
-
-    print(
-        "TOKEN_SELECTOR: universe "
-        f"total={len(symbols)} eligible={len(eligible_symbols)} "
-        f"reject_blocked={filter_counts['blocked']} "
-        f"reject_base={filter_counts['base_excluded']} "
-        f"reject_spread={filter_counts['spread']} reject_market={filter_counts['market']} "
-        f"reject_price={filter_counts['price']} reject_quote_volume={filter_counts['quote_volume']} "
-        f"reject_trade_count={filter_counts['trade_count']} reject_change24h={filter_counts['change_24h']} "
-        f"min_window={SELECTOR_MIN_WINDOW_PCT:.2f}% max_window={SELECTOR_MAX_WINDOW_PCT:.2f}% "
-        f"min_price={SELECTOR_MIN_PRICE_USDC:.4f} "
-        f"min_quote_volume_24h={SELECTOR_MIN_QUOTE_VOLUME_USDC_24H:.0f} "
-        f"min_trade_count_24h={SELECTOR_MIN_TRADE_COUNT_24H}"
+    eligible_symbols, filter_counts = _tradable_symbols(
+        symbols, spread_map, market_map, excluded_symbols
     )
+    _log_tradable_universe(symbols, eligible_symbols, filter_counts)
     candidates = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -419,6 +429,43 @@ def collect_top_movers(excluded_symbols: set[str] | None = None, positive_only: 
     # A fallback must never relax liquidity, spread, price, or movement gates.
     # It only changes ranking behaviour after the normal tradable universe is built.
     return collect_candidates(excluded_symbols=excluded_symbols, positive_only=positive_only)
+
+
+def choose_tradable_anchor(current_symbol: str, excluded_symbols: set[str] | None = None):
+    """Return a liquid anchor only when the active symbol is no longer tradable.
+
+    The anchor does not create an entry signal; it gives the common strategy a
+    reliable market-data stream while the selector waits for its next real mover.
+    """
+    symbols = get_symbols_usdc_trading()
+    spread_map = get_spread_map()
+    market_map = get_market_stats_map()
+    excluded = {str(sym).strip().upper() for sym in (excluded_symbols or set()) if str(sym).strip()}
+    eligible_symbols, _ = _tradable_symbols(symbols, spread_map, market_map, excluded)
+    active = str(current_symbol or "").strip().upper()
+    if active in eligible_symbols:
+        return None, True
+    anchors = []
+    for sym in eligible_symbols:
+        market = market_map.get(sym) or {}
+        anchors.append({
+            "symbol": sym,
+            "pct": 0.0,
+            "spread_pct": float(spread_map.get(sym, 0.0)) * 100.0,
+            "last_price": float(market.get("last_price") or 0.0),
+            "quote_volume_24h": float(market.get("quote_volume_24h") or 0.0),
+            "trade_count_24h": int(market.get("trade_count_24h") or 0),
+            "change_pct_24h": float(market.get("change_pct_24h") or 0.0),
+        })
+    anchors.sort(
+        key=lambda item: (
+            -item["quote_volume_24h"],
+            -item["trade_count_24h"],
+            item["spread_pct"],
+            item["symbol"],
+        )
+    )
+    return (anchors[0] if anchors else None), False
 
 
 def rank_candidates(candidates, score_map, quality_map=None):
@@ -737,6 +784,24 @@ def main():
                 write_service_env(fallback["symbol"], fallback["pct"], DEFAULT_PROFILE)
                 restart_bot_if_symbol_changed(current_symbol, fallback["symbol"])
                 return 0
+        anchor, current_is_tradable = choose_tradable_anchor(
+            current_symbol,
+            excluded_symbols=blocked_symbols,
+        )
+        if anchor and not current_is_tradable:
+            print(
+                f"TOKEN_SELECTOR: anchor selected {anchor['symbol']} "
+                f"reason=current_not_tradable current={current_symbol or '-'} "
+                f"qv24h={anchor['quote_volume_24h']:.0f} "
+                f"spread={anchor['spread_pct']:.3f}%"
+            )
+            write_service_env(anchor["symbol"], anchor["pct"], DEFAULT_PROFILE)
+            restart_bot_if_symbol_changed(current_symbol, anchor["symbol"])
+            _save_selector_state({
+                "last_switch_ts": time.time(),
+                "last_switch_symbol": anchor["symbol"],
+            })
+            return 0
         top_mover, top_ranked = choose_top_mover_fallback(
             excluded_symbols=blocked_symbols,
             quality_map=quality_map,
