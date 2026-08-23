@@ -72,6 +72,17 @@ def _save_selector_state(state: dict) -> None:
         pass
 
 
+def _record_selector_decision(reason: str, **fields) -> None:
+    """Persist the last selector verdict for dashboard and offline audit."""
+    state = _load_selector_state()
+    state.update({
+        "updated_at": time.time(),
+        "last_reason": str(reason),
+        **{key: value for key, value in fields.items() if value is not None},
+    })
+    _save_selector_state(state)
+
+
 def _minimum_hold_remaining_minutes(hold_age_min: float) -> float:
     return max(0.0, SELECTOR_FLAT_MIN_HOLD_MINUTES - max(0.0, hold_age_min))
 
@@ -273,7 +284,14 @@ def get_market_stats_map():
     return out
 
 
-def _tradable_symbols(symbols, spread_map, market_map, excluded_symbols: set[str]):
+def _tradable_symbols(
+    symbols,
+    spread_map,
+    market_map,
+    excluded_symbols: set[str],
+    *,
+    include_rejections: bool = False,
+):
     filter_counts = {
         "blocked": 0,
         "base_excluded": 0,
@@ -285,35 +303,54 @@ def _tradable_symbols(symbols, spread_map, market_map, excluded_symbols: set[str
         "change_24h": 0,
     }
     eligible_symbols = []
+    rejected = []
+
+    def reject(sym, reason):
+        filter_counts[reason] += 1
+        if not include_rejections:
+            return
+        market = market_map.get(sym) or {}
+        rejected.append({
+            "symbol": sym,
+            "reason_rejected": reason,
+            "spread_pct": float(spread_map.get(sym, 0.0) or 0.0) * 100.0,
+            "last_price": float(market.get("last_price") or 0.0),
+            "quote_volume_24h": float(market.get("quote_volume_24h") or 0.0),
+            "trade_count_24h": int(market.get("trade_count_24h") or 0),
+            "change_pct_24h": float(market.get("change_pct_24h") or 0.0),
+        })
+
     for sym in symbols:
         if sym in excluded_symbols:
-            filter_counts["blocked"] += 1
+            reject(sym, "blocked")
             continue
         if _base_asset(sym) in EXCLUDED_BASE_ASSETS:
-            filter_counts["base_excluded"] += 1
+            reject(sym, "base_excluded")
             continue
         spread = spread_map.get(sym)
         if spread is None or spread > SELECTOR_MAX_SPREAD_PCT:
-            filter_counts["spread"] += 1
+            reject(sym, "spread")
             continue
         market = market_map.get(sym)
         if market is None:
-            filter_counts["market"] += 1
+            reject(sym, "market")
             continue
         if float(market["last_price"]) < SELECTOR_MIN_PRICE_USDC:
-            filter_counts["price"] += 1
+            reject(sym, "price")
             continue
         if float(market["quote_volume_24h"]) < SELECTOR_MIN_QUOTE_VOLUME_USDC_24H:
-            filter_counts["quote_volume"] += 1
+            reject(sym, "quote_volume")
             continue
         if int(market["trade_count_24h"]) < SELECTOR_MIN_TRADE_COUNT_24H:
-            filter_counts["trade_count"] += 1
+            reject(sym, "trade_count")
             continue
         change_24h = float(market["change_pct_24h"])
         if change_24h < SELECTOR_MIN_24H_CHANGE_PCT or change_24h > SELECTOR_MAX_24H_CHANGE_PCT:
-            filter_counts["change_24h"] += 1
+            reject(sym, "change_24h")
             continue
         eligible_symbols.append(sym)
+    if include_rejections:
+        return eligible_symbols, filter_counts, rejected
     return eligible_symbols, filter_counts
 
 
@@ -331,6 +368,51 @@ def _log_tradable_universe(symbols, eligible_symbols, filter_counts) -> None:
         f"min_quote_volume_24h={SELECTOR_MIN_QUOTE_VOLUME_USDC_24H:.0f} "
         f"min_trade_count_24h={SELECTOR_MIN_TRADE_COUNT_24H}"
     )
+
+
+def _format_selector_candidate(prefix: str, item: dict) -> str:
+    return (
+        f"{prefix} symbol={item.get('symbol', '')} "
+        f"spread={float(item.get('spread_pct', 0.0) or 0.0):.4f}% "
+        f"quote_volume_24h={float(item.get('quote_volume_24h', 0.0) or 0.0):.0f} "
+        f"trade_count_24h={int(item.get('trade_count_24h', 0) or 0)} "
+        f"price={float(item.get('last_price', 0.0) or 0.0):.8f} "
+        f"change_2m={item.get('pct', item.get('change_2m', 'na'))} "
+        f"change_24h={float(item.get('change_pct_24h', 0.0) or 0.0):.4f}% "
+        f"reason_rejected={item.get('reason_rejected', 'eligible')}"
+    )
+
+
+def _log_selector_rejections(filter_counts: dict, rejected: list[dict]) -> None:
+    print(
+        "TOKEN_SELECTOR_REJECT_SUMMARY "
+        + " ".join(f"{key}={value}" for key, value in sorted(filter_counts.items()))
+    )
+    ranked = sorted(
+        rejected,
+        key=lambda item: (
+            -float(item.get("quote_volume_24h", 0.0) or 0.0),
+            float(item.get("spread_pct", 0.0) or 0.0),
+            item.get("symbol", ""),
+        ),
+    )
+    for item in ranked[:5]:
+        try:
+            item["change_2m"] = f"{float(change_window_pct(item['symbol']) or 0.0):.4f}%"
+        except Exception:
+            item["change_2m"] = "na"
+        print(_format_selector_candidate("TOKEN_SELECTOR_TOP_REJECTED", item))
+
+
+def _log_selector_eligible(candidates: list[dict]) -> None:
+    for item in candidates[:5]:
+        print(_format_selector_candidate("TOKEN_SELECTOR_TOP_ELIGIBLE", item))
+
+
+def _log_selector_selected_reason(reason: str, **fields) -> None:
+    _record_selector_decision(reason, **fields)
+    detail = " ".join(f"{key}={value}" for key, value in fields.items())
+    print(f"TOKEN_SELECTOR_SELECTED_REASON reason={reason} {detail}".rstrip())
 
 def change_window_pct(symbol: str, minutes: int = WINDOW_MINUTES):
     # klines-based price change over `minutes` 1m candles
@@ -387,10 +469,15 @@ def collect_candidates(excluded_symbols: set[str] | None = None, positive_only: 
     spread_map = get_spread_map()
     market_map = get_market_stats_map()
     excluded_symbols = {str(sym).strip().upper() for sym in (excluded_symbols or set()) if str(sym).strip()}
-    eligible_symbols, filter_counts = _tradable_symbols(
-        symbols, spread_map, market_map, excluded_symbols
+    eligible_symbols, filter_counts, rejected = _tradable_symbols(
+        symbols,
+        spread_map,
+        market_map,
+        excluded_symbols,
+        include_rejections=True,
     )
     _log_tradable_universe(symbols, eligible_symbols, filter_counts)
+    _log_selector_rejections(filter_counts, rejected)
     candidates = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
@@ -422,6 +509,7 @@ def collect_candidates(excluded_symbols: set[str] | None = None, positive_only: 
                 "change_pct_24h": float(market.get("change_pct_24h") or 0.0),
             })
     candidates.sort(key=lambda item: (item["pct"], -item["spread_pct"], item["symbol"]), reverse=True)
+    _log_selector_eligible(candidates)
     return candidates
 
 
@@ -725,6 +813,7 @@ def main():
         )
         if locked_symbol and locked_symbol != current_symbol:
             write_service_env(locked_symbol, 0.0, DEFAULT_PROFILE)
+        _log_selector_selected_reason("WALLET_POSITION_LOCK", symbol=locked_symbol or current_symbol or "-")
         return 0
 
     sync_info = sync_trade_memory()
@@ -783,6 +872,11 @@ def main():
                 )
                 write_service_env(fallback["symbol"], fallback["pct"], DEFAULT_PROFILE)
                 restart_bot_if_symbol_changed(current_symbol, fallback["symbol"])
+                _log_selector_selected_reason(
+                    "CURRENT_SYMBOL_BLOCKED_FALLBACK",
+                    symbol=fallback["symbol"],
+                    current=current_symbol,
+                )
                 return 0
         anchor, current_is_tradable = choose_tradable_anchor(
             current_symbol,
@@ -801,6 +895,11 @@ def main():
                 "last_switch_ts": time.time(),
                 "last_switch_symbol": anchor["symbol"],
             })
+            _log_selector_selected_reason(
+                "ANCHOR_CURRENT_NOT_TRADABLE",
+                symbol=anchor["symbol"],
+                current=current_symbol,
+            )
             return 0
         top_mover, top_ranked = choose_top_mover_fallback(
             excluded_symbols=blocked_symbols,
@@ -820,6 +919,11 @@ def main():
                 "last_switch_ts": time.time(),
                 "last_switch_symbol": top_mover["symbol"],
             })
+            _log_selector_selected_reason(
+                "TOP_MOVER_FALLBACK",
+                symbol=top_mover["symbol"],
+                current=current_symbol,
+            )
             return 0
         print(
             f"TOKEN_SELECTOR: no eligible positive {QUOTE_ASSET} symbol found "
@@ -828,6 +932,7 @@ def main():
             f"min_quote_volume_24h={SELECTOR_MIN_QUOTE_VOLUME_USDC_24H:.0f} "
             f"min_trade_count_24h={SELECTOR_MIN_TRADE_COUNT_24H})"
         )
+        _log_selector_selected_reason("NO_ELIGIBLE_POSITIVE", symbol=current_symbol or "-")
         return 0
     raw_top = ranked[0] if ranked else None
     if raw_top and raw_top["symbol"] != chosen["symbol"] and raw_top.get("is_toxic"):
@@ -864,6 +969,7 @@ def main():
         current_score = current_in_ranked["final_score"] if current_in_ranked else 0.0
         write_service_env(current_symbol, current_score, DEFAULT_PROFILE)
         restart_bot_if_symbol_changed(current_symbol, current_symbol)
+        _log_selector_selected_reason("MINIMUM_HOLD", symbol=current_symbol)
         return 0
     if current_is_flat and is_new_token:
         print(
@@ -888,6 +994,7 @@ def main():
             )
             write_service_env(current_symbol, current_score, DEFAULT_PROFILE)
             restart_bot_if_symbol_changed(current_symbol, current_symbol)
+            _log_selector_selected_reason("HYSTERESIS_HOLD", symbol=current_symbol)
             return 0
         print(
             f"TOKEN_SELECTOR: early switch authorized "
@@ -908,6 +1015,11 @@ def main():
             "last_switch_ts": time.time(),
             "last_switch_symbol": chosen["symbol"],
         })
+    _log_selector_selected_reason(
+        "BEST_ELIGIBLE_CANDIDATE",
+        symbol=chosen["symbol"],
+        current=current_symbol or "-",
+    )
     return 0
 
 if __name__ == "__main__":

@@ -32,15 +32,45 @@ def test_stream_uses_kraken_ws_v2_doge_symbol():
     assert stream._ws_symbol() == "DOGE/USDC"
 
 
-def test_stream_subscribes_to_kraken_book_by_default():
+def test_stream_subscribes_to_kraken_ticker_bbo_by_default():
     sent = []
     stream = Stream(SimpleNamespace(wsUrl="wss://example.invalid"), "BTCUSDC", mapper=FakeMapper())
     stream.on_open(SimpleNamespace(send=sent.append))
 
     assert json.loads(sent[0]) == {
         "method": "subscribe",
-        "params": {"channel": "book", "symbol": ["BTC/USDC"], "depth": 10},
+        "params": {"channel": "ticker", "symbol": ["BTC/USDC"], "event_trigger": "bbo"},
     }
+
+
+def test_stream_ticker_snapshot_updates_best_bid_ask():
+    stream = Stream(SimpleNamespace(wsUrl="wss://example.invalid"), "BTCUSDC", mapper=FakeMapper())
+    stream.on_message(None, json.dumps({
+        "channel": "ticker",
+        "type": "snapshot",
+        "data": [{"bid": 100.0, "ask": 101.0}],
+    }))
+
+    assert stream.snapshot()[:2] == (100.0, 101.0)
+
+
+def test_stale_stream_requests_reconnect_without_using_live_rest_fallback():
+    class FakeSocket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    stream = Stream(SimpleNamespace(wsUrl="wss://example.invalid", dryRun=False, wsStaleSec=0.01), "BTCUSDC", mapper=FakeMapper())
+    fake_socket = FakeSocket()
+    stream._ws = fake_socket
+    stream.bestBid = 100.0
+    stream.bestAsk = 101.0
+    stream.lastUpdate = 1.0
+
+    assert stream.snapshot() == (0.0, 0.0, 0.0, 0)
+    assert fake_socket.closed is True
 
 
 def test_stream_book_snapshot_and_update_keep_best_bid_ask():

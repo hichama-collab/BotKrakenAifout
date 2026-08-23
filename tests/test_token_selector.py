@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -144,6 +145,46 @@ class TradableAnchorTests(unittest.TestCase):
         self.assertEqual(anchor["symbol"], "BTCUSDC")
         self.assertIsNone(no_anchor)
         self.assertTrue(btc_is_tradable)
+
+
+class SelectorObservabilityTests(unittest.TestCase):
+    def test_rejected_candidates_include_the_first_blocking_gate(self):
+        markets = {
+            "BTCUSDC": {
+                "last_price": 100.0,
+                "quote_volume_24h": 9_000_000.0,
+                "trade_count_24h": 10_000,
+                "change_pct_24h": 1.0,
+            },
+            "XMRUSDC": {
+                "last_price": 100.0,
+                "quote_volume_24h": 9_000_000.0,
+                "trade_count_24h": 10_000,
+                "change_pct_24h": 1.0,
+            },
+        }
+        eligible, counts, rejected = selector._tradable_symbols(
+            ["BTCUSDC", "XMRUSDC"],
+            {"BTCUSDC": 0.0001, "XMRUSDC": 0.003},
+            markets,
+            set(),
+            include_rejections=True,
+        )
+
+        self.assertEqual(eligible, ["BTCUSDC"])
+        self.assertEqual(counts["spread"], 1)
+        self.assertEqual(rejected[0]["symbol"], "XMRUSDC")
+        self.assertEqual(rejected[0]["reason_rejected"], "spread")
+
+    def test_selector_decision_is_persisted_for_dashboard(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "selector_state.json"
+            with patch.object(selector, "SELECTOR_STATE_PATH", state_path):
+                selector._log_selector_selected_reason("NO_ELIGIBLE_POSITIVE", symbol="XRPUSDC")
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(state["last_reason"], "NO_ELIGIBLE_POSITIVE")
+        self.assertEqual(state["symbol"], "XRPUSDC")
 
 
 class ServiceEnvTests(unittest.TestCase):

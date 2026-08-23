@@ -10,6 +10,7 @@ from typing import Optional
 from execution.fee_model import FeeModel
 from state.persisted import PersistedPosition, save_position, load_position, clear_position, reconcile_with_wallet
 from risk.circuit_breaker import CircuitBreaker
+from core.entry_diagnostics import format_entry_gate_trace, p_tape_snapshot, quote_sizing_snapshot
 
 
 def momentum_ok(
@@ -991,6 +992,47 @@ def main():
 
     # NEW: Runtime dir for status JSON
     runtime_dir = Path(getattr(cfg, "dataDir", "data")) / "runtime"
+    entryGateContext = {}
+    lastHoldReason = ""
+    lastEntryGateTrace = {}
+    lastQuoteBalanceDiagnostic = None
+
+    def quote_sizing_diagnostic(quote_free):
+        return quote_sizing_snapshot(
+            quote_free=quote_free,
+            quote_asset=getattr(cfg, "quoteAsset", "USDC"),
+            min_notional=minNotional,
+            cap=cap,
+            fee_buffer_pct=float(getattr(cfg, "feeBufPct", 0.0) or 0.0),
+            dry_run=bool(getattr(cfg, "dryRun", False)),
+            has_position=pos is not None,
+        )
+
+    def log_quote_balance_diagnostic(snapshot: dict):
+        nonlocal lastQuoteBalanceDiagnostic
+        signature = (
+            snapshot.get("quote_asset"),
+            snapshot.get("quote_free"),
+            snapshot.get("min_notional"),
+            snapshot.get("sizing_cap"),
+            snapshot.get("can_buy"),
+            snapshot.get("blocking_reason"),
+        )
+        if signature == lastQuoteBalanceDiagnostic:
+            return
+        lastQuoteBalanceDiagnostic = signature
+        message = (
+            "QUOTE_BALANCE "
+            f"QUOTE_FREE={snapshot.get('quote_free')} "
+            f"QUOTE_ASSET={snapshot.get('quote_asset')} "
+            f"MIN_NOTIONAL={snapshot.get('min_notional')} "
+            f"SIZING_CAP={snapshot.get('sizing_cap')} "
+            f"CAN_BUY={str(bool(snapshot.get('can_buy'))).lower()} "
+            f"BLOCKING_REASON={snapshot.get('blocking_reason') or 'NONE'}"
+        )
+        print(message)
+        logTrade(message)
+
     wallet_flat_guard = loadWalletFlatGuard(symbol)
     if wallet_flat_guard:
         cooldownUntil = max(
@@ -1138,12 +1180,18 @@ def main():
         detail="",
         signal=None,
         entry_edge=None,
+        final_hold_reason="",
     ):
-        nonlocal lastHoldCsv
+        nonlocal lastHoldCsv, lastHoldReason, lastEntryGateTrace
         signal = signal or {}
         if (now - lastHoldCsv) < holdCsvEvery:
             return
         lastHoldCsv = now
+        trace = dict(entryGateContext)
+        trace["hold_reason"] = str(reason)
+        trace["final_hold_reason"] = final_hold_reason or trace.get("final_hold_reason") or str(reason)
+        lastHoldReason = str(reason)
+        lastEntryGateTrace = trace
         try:
             row = {
                 'ts_utc': int(now),
@@ -1174,6 +1222,12 @@ def main():
                 'p4': '' if p4 is None else float(p4),
                 'entry_vs_mid_pct': '',
                 'mid_vs_entry_pct': '',
+                'quote_asset': trace.get("quote_asset", ""),
+                'quote_free': trace.get("quote_free", ""),
+                'sizing_cap': trace.get("sizing_cap", ""),
+                'can_buy': "" if trace.get("can_buy") is None else int(bool(trace.get("can_buy"))),
+                'blocking_reason': trace.get("blocking_reason", ""),
+                'entry_gate_trace': json.dumps(trace, separators=(",", ":"), sort_keys=True),
             }
             row.update(entry_edge_csv_fields(entry_edge))
             logCsv(row)
@@ -1181,6 +1235,9 @@ def main():
             pass
         try:
             detail_suffix = f" {detail}" if detail else ""
+            trace_line = f"ENTRY_GATE_TRACE {format_entry_gate_trace(trace)}"
+            logTrade(trace_line)
+            print(trace_line)
             logTrade(
                 f"DECIDE_HOLD reason={reason} spread={spread*100:.4f}% mom={momPct*100:.4f}% "
                 f"range={momRangePct*100:.4f}% up={upRatio*100:.2f}% "
@@ -1416,6 +1473,14 @@ def main():
                 logTrade=logTrade,
             )
             handle_wallet_sync_info(syncInfo, bid)
+            quote_free = None
+            try:
+                if isinstance(syncInfo, dict):
+                    quote_free = float(syncInfo.get("usdc"))
+            except (TypeError, ValueError):
+                quote_free = None
+            quoteSizing = quote_sizing_diagnostic(quote_free)
+            log_quote_balance_diagnostic(quoteSizing)
             
             # cooldown log so it doesn't look frozen
             if now < cooldownUntil:
@@ -1431,12 +1496,7 @@ def main():
                 continue
 
             # cache quote balance from wallet sync (used for entry sizing)
-            usdc = None
-            try:
-                if isinstance(syncInfo, dict):
-                    usdc = float(syncInfo.get('usdc', 0.0))
-            except Exception:
-                usdc = None
+            usdc = quote_free
 
 
             # wallet placeholder guard: if entry==0, try to restore from persisted file.
@@ -1577,6 +1637,59 @@ def main():
                 except Exception as e:
                     logErr("RANGE_ANALYSIS_FAIL", e)
 
+            pTrace = p_tape_snapshot(P1, P2, P3, P4)
+            trace_entry_fee_mult = float(getattr(cfg, "entryFeeEdgeMult", 1.0) or 0.0)
+            trace_fee_edge_pct = (
+                (float(_fee_model.fee_rate) * 2.0)
+                + float(spread)
+                + float(getattr(cfg, "minProfitBufferPct", 0.0) or 0.0)
+            ) * trace_entry_fee_mult * 100.0
+            entryGateContext.clear()
+            entryGateContext.update({
+                "symbol": symbol,
+                "profile": profile.name,
+                "strategy": getattr(cfg, "strategyName", ""),
+                "has_new_tick": bool(has_new_tick),
+                "pending_switch": bool(pendingSwitchSymbol),
+                "p_entry_enabled": bool(getattr(cfg, "pEntryEnabled", True)),
+                "has_p_window": pTrace["has_p_window"],
+                "p1": P1,
+                "p2": P2,
+                "p3": P3,
+                "p4": P4,
+                "p_rising": pTrace["p_rising"],
+                "p_sample_interval_sec": float(getattr(cfg, "pSampleIntervalSec", 0.0) or 0.0),
+                "mom_ok": bool(momOk),
+                "mom_pct": float(momPct) * 100.0,
+                "mom_min_pct": float(momMinPct) * 100.0,
+                "range_enabled": bool(range_enabled),
+                "range_ok": bool(range_signal) if range_enabled else True,
+                "burst_enabled": bool(getattr(cfg, "burstEntryEnabled", False)),
+                "burst_ok": bool(burstOk),
+                "up_ratio": float(upRatio) * 100.0,
+                "hard_min_up_ratio": float(getattr(cfg, "entryHardMinUpRatio", 0.0) or 0.0) * 100.0,
+                "strict_up_moves": pTrace["strict_up_moves"],
+                "entry_min_strict_ups": max(1, int(getattr(cfg, "entryMinStrictUps", 1) or 1)),
+                "tape_progress_pct": pTrace["tape_progress_pct"],
+                "entry_min_tape_progress_pct": float(getattr(cfg, "entryMinTapeProgressPct", 0.0) or 0.0) * 100.0,
+                "spread_pct": float(spread) * 100.0,
+                "max_spread_pct": float(spreadLimit) * 100.0,
+                "fee_edge_pct": trace_fee_edge_pct,
+                "tape_vs_fee_ok": pTrace["tape_progress_pct"] >= trace_fee_edge_pct,
+                "near_peak": False,
+                "pic_filter_enabled": bool(getattr(cfg, "picFilter_enabled", False)),
+                "blocked_symbol": symbol in blockedSymbols,
+                "quote_asset": quoteSizing["quote_asset"],
+                "quote_free": quoteSizing["quote_free"],
+                "min_notional": quoteSizing["min_notional"],
+                "sizing_cap": quoteSizing["sizing_cap"],
+                "qty_estimated": None,
+                "sizing_ok": quoteSizing["can_buy"],
+                "can_buy": quoteSizing["can_buy"],
+                "blocking_reason": quoteSizing["blocking_reason"],
+                "final_hold_reason": "",
+            })
+
             if now - lastChk >= cfg.chkEvery:
                 lastChk = now
                 chk_msg = (
@@ -1610,6 +1723,14 @@ def main():
                     "mom_pct": momPct * 100,
                     "mom_range_pct": momRangePct * 100,
                     "up_ratio": upRatio * 100,
+                    "quote_asset": quoteSizing["quote_asset"],
+                    "quote_free": quoteSizing["quote_free"],
+                    "min_notional": quoteSizing["min_notional"],
+                    "sizing_cap": quoteSizing["sizing_cap"],
+                    "can_buy": quoteSizing["can_buy"],
+                    "blocking_reason": quoteSizing["blocking_reason"],
+                    "last_hold_reason": lastHoldReason,
+                    "last_entry_gate_trace": lastEntryGateTrace,
                 }
                 if range_snapshot:
                     status_data["snapshot"] = {
@@ -1734,7 +1855,9 @@ def main():
                         lookback_seconds=int(getattr(cfg, "picFilter_lookbackSec", 180)),
                         peak_threshold_pct=float(getattr(cfg, "picFilter_thresholdPct", 0.001)),
                     )
-                    if should_block_near_peak(entryMode, _pic):
+                    near_peak = should_block_near_peak(entryMode, _pic)
+                    entryGateContext["near_peak"] = bool(near_peak)
+                    if near_peak:
                         maybe_hold(
                             now,
                             f"NEAR_PEAK dist={_pic.distance_from_peak_pct*100:.3f}%"
@@ -2447,8 +2570,17 @@ def main():
                 live_usdc = get_usdc_balance_safe(bx, cfg)
                 if live_usdc is not None:
                     usdc = live_usdc
+                    liveQuoteSizing = quote_sizing_diagnostic(usdc)
+                    entryGateContext.update({
+                        "quote_free": liveQuoteSizing["quote_free"],
+                        "sizing_cap": liveQuoteSizing["sizing_cap"],
+                        "sizing_ok": liveQuoteSizing["can_buy"],
+                        "can_buy": liveQuoteSizing["can_buy"],
+                        "blocking_reason": liveQuoteSizing["blocking_reason"],
+                    })
 
                 if usdc is None:
+                    entryGateContext["sizing_ok"] = False
                     maybe_hold(
                         now,
                         'HOLD_BAL',
@@ -2468,6 +2600,11 @@ def main():
                     continue
 
                 if usdc < float(minNotional):
+                    entryGateContext["sizing_ok"] = False
+                    entryGateContext["can_buy"] = False
+                    entryGateContext["blocking_reason"] = (
+                        "LIVE_NO_QUOTE_BALANCE" if not bool(getattr(cfg, "dryRun", False)) else ""
+                    )
                     maybe_hold(
                         now,
                         'HOLD_MIN_NOTIONAL',
@@ -2496,6 +2633,12 @@ def main():
                 spend = min(cap, spendable_usdc)
 
                 if spend < float(minNotional):
+                    entryGateContext["sizing_ok"] = False
+                    entryGateContext["can_buy"] = False
+                    entryGateContext["sizing_cap"] = spend
+                    entryGateContext["blocking_reason"] = (
+                        "LIVE_NO_QUOTE_BALANCE" if not bool(getattr(cfg, "dryRun", False)) else ""
+                    )
                     maybe_hold(
                         now,
                         'HOLD_MIN_NOTIONAL',
@@ -2587,6 +2730,9 @@ def main():
 
                 if qty <= 0 or notional < float(minNotional):
                     missing_quote = max(0.0, required_quote - max_quote_budget) if required_quote > 0 else 0.0
+                    entryGateContext["qty_estimated"] = qty
+                    entryGateContext["sizing_ok"] = False
+                    entryGateContext["can_buy"] = False
                     maybe_hold(
                         now,
                         'HOLD_QTY',
@@ -2611,6 +2757,10 @@ def main():
                     )
                     time.sleep(cfg.idleSleep)
                     continue
+
+                entryGateContext["qty_estimated"] = qty
+                entryGateContext["sizing_ok"] = True
+                entryGateContext["can_buy"] = True
 
                 try:
                     order = placeLimit(
@@ -2967,21 +3117,31 @@ def main():
                 if not buySignal:
                     if pendingSwitchSymbol:
                         hold_reason = "HOLD_TOKEN_SWITCH_PENDING"
+                        trace_hold_reason = "TOKEN_SWITCH_PENDING"
                         hold_detail = f"pending_symbol={pendingSwitchSymbol}"
                     elif not has_new_tick:
                         hold_reason = "HOLD_NO_NEW_TICK"
+                        trace_hold_reason = "NO_NEW_TICK"
                         hold_detail = f"tick_seq={tick_seq}"
                     elif not pEntryEnabled and not range_signal and not burstOk:
                         hold_reason = "HOLD_NO_ENTRY_SIGNAL"
+                        trace_hold_reason = "ENTRY_DISABLED"
                         hold_detail = (
                             f"p_entry=0 range_signal=0 burst_ok=0 "
                             f"burst_enabled={int(bool(getattr(cfg, 'burstEntryEnabled', False)))}"
                         )
                     elif pEntryEnabled and any(v is None for v in (P1, P2, P3, P4)):
                         hold_reason = "HOLD_PDATA"
+                        trace_hold_reason = "P_WINDOW_ABSENT"
                         hold_detail = "waiting_for_p_window"
                     else:
                         hold_reason = "HOLD_NO_ENTRY_SIGNAL"
+                        if pEntryEnabled and not pTrace["p_rising"]:
+                            trace_hold_reason = "P_RISING_FALSE"
+                        elif pEntryEnabled and not momOk:
+                            trace_hold_reason = "MOMENTUM_FALSE"
+                        else:
+                            trace_hold_reason = "NO_ENTRY_SIGNAL"
                         p_progress = ((float(P1) - float(P4)) / float(P4) * 100.0) if P1 is not None and P4 not in (None, 0) else 0.0
                         _burst_ret = float((burstStats or {}).get("return_pct", 0.0) or 0.0) * 100.0
                         _burst_need = float((burstStats or {}).get("required_return_pct", 0.0) or 0.0) * 100.0
@@ -3011,6 +3171,7 @@ def main():
                         P3,
                         P4,
                         detail=hold_detail,
+                        final_hold_reason=trace_hold_reason,
                     )
                 time.sleep(cfg.idleSleep)
                 continue

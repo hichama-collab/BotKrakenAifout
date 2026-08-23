@@ -26,6 +26,8 @@ TRADE_CSV_FIELDNAMES = [
     "fee_source", "fee_buy", "fee_sell", "commission_asset",
     "executed_qty", "quote_qty", "pnl_gross", "pnl_net_pct",
     "wallet_sync_status", "error_code", "error_msg",
+    "quote_asset", "quote_free", "sizing_cap", "can_buy", "blocking_reason",
+    "entry_gate_trace",
 ]
 
 

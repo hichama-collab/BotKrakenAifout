@@ -349,6 +349,8 @@ function botDashboard() {
     positionLiveReady: false,
     monitor: null,
     wallet: {},
+    execution: {},
+    selectorState: {},
     control: {},
 
     // Services
@@ -416,6 +418,8 @@ function botDashboard() {
         this.position = d.position;
         this.monitor = d.monitor || null;
         this.wallet = d.wallet || {};
+        this.execution = d.execution || {};
+        this.selectorState = d.selector_state || {};
         this.control = d.control || {};
         this.pnlToday = d.pnl?.today;
         this.pnlSession = d.pnl?.session;
@@ -518,11 +522,11 @@ function botDashboard() {
           href: '/logs',
         };
       }
-      if (reason.includes('MIN_NOTIONAL') || (!this.hasPosition && Number(this.wallet.usdc_free) < 5)) {
+      if (reason.includes('NO_QUOTE_BALANCE') || reason.includes('MIN_NOTIONAL') || (!this.hasPosition && this.monitorMetrics.can_buy === false)) {
         return {
           level: 'warning',
-          title: 'Solde USDC insuffisant',
-          detail: `${Number(this.wallet.usdc_free || 0).toFixed(2)} USDC disponibles.`,
+          title: `Solde ${this.monitorMetrics.quote_asset || this.wallet.quote_asset || 'quote'} insuffisant`,
+          detail: `${this.fmtQuote(this.monitorMetrics.quote_free ?? this.wallet.quote_free, this.monitorMetrics.quote_asset || this.wallet.quote_asset)} disponibles pour un minimum de ${this.fmtQuote(this.monitorMetrics.min_notional, this.monitorMetrics.quote_asset || this.wallet.quote_asset)}.`,
           action: 'Voir les services',
         };
       }
@@ -538,7 +542,7 @@ function botDashboard() {
       return {
         level: 'normal',
         title: `Surveillance ${this.fmtSymbol(this.activeToken)}`,
-        detail: `${this.profile} · mode ${this.control.mode === 'auto' ? 'automatique' : 'manuel'} · ${Number(this.wallet.usdc_free || 0).toFixed(2)} USDC`,
+        detail: `${this.profile} · mode ${this.control.mode === 'auto' ? 'automatique' : 'manuel'} · ${this.fmtQuote(this.monitorMetrics.quote_free ?? this.wallet.quote_free, this.monitorMetrics.quote_asset || this.wallet.quote_asset)}`,
         action: 'Gérer',
       };
     },
@@ -559,6 +563,13 @@ function botDashboard() {
       return this.monitor?.decision || {};
     },
 
+    get entryGateReason() {
+      return this.monitorDecision.entry_gate_trace?.final_hold_reason
+        || this.monitorMetrics.last_hold_reason
+        || this.monitorDecision.reason
+        || '—';
+    },
+
     get decisionLabel() {
       const reason = this.monitorDecision.reason || '';
       if (!reason) return '—';
@@ -576,6 +587,10 @@ function botDashboard() {
 
     pnlClass(v) { return colorClass(v); },
     fmtUsdc(v) { return fmt.usdc(v, true); },
+    fmtQuote(v, asset = 'USDC') {
+      if (v == null || isNaN(v)) return '—';
+      return `${Number(v).toFixed(4)} ${asset || 'USDC'}`;
+    },
     fmtPct(v) { return fmt.pct(v, true); },
     fmtPrice(v) { return fmt.price(v); },
     fmtQty(v) { return fmt.qty(v); },

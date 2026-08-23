@@ -20,9 +20,14 @@ class Stream:
         self.lastUpdate = 0.0
         self.tickSeq = 0
         self.url = str(getattr(cfg, "wsUrl", "wss://ws.kraken.com/v2") or "wss://ws.kraken.com/v2")
-        self.channel = str(getattr(cfg, "wsChannel", "book") or "book").strip().lower()
+        self.channel = str(getattr(cfg, "wsChannel", "ticker") or "ticker").strip().lower()
         if self.channel not in {"book", "ticker"}:
-            self.channel = "book"
+            self.channel = "ticker"
+        self.tickerEventTrigger = str(
+            getattr(cfg, "wsTickerEventTrigger", "bbo") or "bbo"
+        ).strip().lower()
+        if self.tickerEventTrigger not in {"bbo", "trades"}:
+            self.tickerEventTrigger = "bbo"
         try:
             self.bookDepth = int(getattr(cfg, "wsBookDepth", 10) or 10)
         except (TypeError, ValueError):
@@ -33,6 +38,9 @@ class Stream:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread = None
+        self._ws = None
+        self._wsConnectedAt = 0.0
+        self._last_stale_reconnect = 0.0
         self._bookBids: dict[float, float] = {}
         self._bookAsks: dict[float, float] = {}
 
@@ -68,11 +76,17 @@ class Stream:
         params = {"channel": self.channel, "symbol": [self._ws_symbol()]}
         if self.channel == "book":
             params["depth"] = self.bookDepth
+        else:
+            params["event_trigger"] = self.tickerEventTrigger
         payload = {
             "method": "subscribe",
             "params": params,
         }
         ws.send(json.dumps(payload))
+        with self._lock:
+            self._wsConnectedAt = time.time()
+            self._last_stale_reconnect = 0.0
+        self._log(f"WS_SUBSCRIBED channel={self.channel} symbol={self._ws_symbol()}")
 
     def _accept_bid_ask(self, bid: float, ask: float) -> None:
         if bid <= 0 or ask <= 0 or bid >= ask:
@@ -144,14 +158,19 @@ class Stream:
             bid = float(bid_raw[0] if isinstance(bid_raw, list) else bid_raw)
             ask = float(ask_raw[0] if isinstance(ask_raw, list) else ask_raw)
             self._accept_bid_ask(bid, ask)
-        except Exception:
+        except Exception as exc:
+            self._log(f"WS_MESSAGE_PARSE_ERROR type={type(exc).__name__}")
             return
 
     def on_error(self, ws, err):
-        print("WS_ERROR", err)
+        self._log(f"WS_ERROR type={type(err).__name__}")
 
     def on_close(self, ws, *args):
-        print("WS_CLOSED")
+        self._log("WS_CLOSED")
+
+    @staticmethod
+    def _log(message: str) -> None:
+        print(message, flush=True)
 
     def start(self):
         if self._thread and self._thread.is_alive():
@@ -163,12 +182,19 @@ class Stream:
                 ws = None
                 try:
                     ws = self._make_ws()
+                    with self._lock:
+                        self._ws = ws
                     ws.run_forever(ping_interval=20, ping_timeout=10)
                 except Exception as e:
-                    print("WS_ERROR", type(e).__name__, str(e))
+                    self._log(f"WS_ERROR type={type(e).__name__}")
+                finally:
+                    with self._lock:
+                        if self._ws is ws:
+                            self._ws = None
+                            self._wsConnectedAt = 0.0
                 if self._stop.is_set():
                     break
-                print("WS_RECONNECT", self.symbol)
+                self._log(f"WS_RECONNECT symbol={self.symbol}")
                 time.sleep(backoff)
 
         self._thread = threading.Thread(target=runner, daemon=True)
@@ -182,6 +208,31 @@ class Stream:
 
     def stop(self):
         self._stop.set()
+        with self._lock:
+            ws = self._ws
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+    def _request_stale_reconnect(self, now: float, stale_sec: float) -> None:
+        with self._lock:
+            if self.lastUpdate <= 0 and (
+                self._wsConnectedAt <= 0 or now - self._wsConnectedAt < stale_sec
+            ):
+                return
+            if now - self._last_stale_reconnect < max(stale_sec, 1.0):
+                return
+            self._last_stale_reconnect = now
+            ws = self._ws
+        if ws is None:
+            return
+        self._log(f"WS_STALE symbol={self.symbol} stale_sec={stale_sec:g} action=reconnect")
+        try:
+            ws.close()
+        except Exception as exc:
+            self._log(f"WS_RECONNECT_CLOSE_ERROR type={type(exc).__name__}")
 
     def _rest_fallback(self) -> tuple[float, float, float, int]:
         if not bool(getattr(self.cfg, "dryRun", False)):
@@ -215,6 +266,7 @@ class Stream:
             a = self.bestAsk
             lu = self.lastUpdate
         if b <= 0 or a <= 0 or lu <= 0 or (now - lu) > stale_sec:
+            self._request_stale_reconnect(now, stale_sec)
             fb, fa, _fl, _fs = self._rest_fallback()
             if fb > 0 and fa > 0:
                 return fb, fa
@@ -230,6 +282,7 @@ class Stream:
             lu = self.lastUpdate
             seq = self.tickSeq
         if b <= 0 or a <= 0 or lu <= 0 or (now - lu) > stale_sec:
+            self._request_stale_reconnect(now, stale_sec)
             fb, fa, flu, fseq = self._rest_fallback()
             if fb > 0 and fa > 0:
                 return fb, fa, flu, fseq

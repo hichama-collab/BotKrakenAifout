@@ -102,6 +102,38 @@
       <div><span>Up ratio</span><strong class="num" x-text="fmtMetric(monitorMetrics.up_ratio, 1, '%')"></strong></div>
     </div>
 
+    <div class="entry-diagnostics" :class="{'is-blocked': monitorMetrics.blocking_reason}">
+      <div>
+        <span>Capital</span>
+        <strong class="num" x-text="fmtQuote(monitorMetrics.quote_free, monitorMetrics.quote_asset)"></strong>
+      </div>
+      <div>
+        <span>Min. ordre</span>
+        <strong class="num" x-text="fmtQuote(monitorMetrics.min_notional, monitorMetrics.quote_asset)"></strong>
+      </div>
+      <div>
+        <span>Cap achat</span>
+        <strong class="num" x-text="fmtQuote(monitorMetrics.sizing_cap, monitorMetrics.quote_asset)"></strong>
+      </div>
+      <div>
+        <span>Achat</span>
+        <strong x-text="monitorMetrics.can_buy ? 'Possible' : 'Bloque'"></strong>
+      </div>
+      <div>
+        <span>Derniere gate</span>
+        <strong x-text="entryGateReason"></strong>
+      </div>
+      <div>
+        <span>Execution</span>
+        <strong class="num" x-text="`${execution.trades_executed || 0} trade(s) / ${execution.order_attempts || 0} tentative(s)`"></strong>
+      </div>
+      <div>
+        <span>Selector</span>
+        <strong x-text="selectorState.last_reason || (control.mode === 'auto' ? 'AUTO' : 'MANUEL')"></strong>
+      </div>
+      <p x-show="monitorMetrics.blocking_reason" x-text="monitorMetrics.blocking_reason"></p>
+    </div>
+
     <footer class="decision-line">
       <div>
         <span class="badge" :class="decisionBadgeClass" x-text="decisionLabel"></span>

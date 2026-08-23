@@ -1713,6 +1713,51 @@ td.num, th.num {
   border-bottom: 1px solid var(--color-border);
 }
 
+.entry-diagnostics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.65rem;
+  padding: 0.58rem 0.8rem;
+  border-bottom: 1px solid var(--color-border);
+  background: rgba(24, 144, 255, 0.035);
+}
+
+.entry-diagnostics.is-blocked {
+  background: rgba(240, 185, 11, 0.07);
+}
+
+.entry-diagnostics > div {
+  min-width: 0;
+}
+
+.entry-diagnostics span {
+  display: block;
+  color: var(--color-text-muted);
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.entry-diagnostics strong {
+  display: block;
+  margin-top: 0.12rem;
+  overflow: hidden;
+  color: var(--color-text-primary);
+  font-size: 0.74rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.entry-diagnostics p {
+  grid-column: 1 / -1;
+  margin: 0;
+  color: var(--color-accent);
+  font-family: var(--font-mono);
+  font-size: 0.67rem;
+  overflow-wrap: anywhere;
+}
+
 .decision-line {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -2258,6 +2303,16 @@ td.num, th.num {
     padding: 0.5rem 0.55rem;
   }
 
+  .entry-diagnostics {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.45rem 0.35rem;
+    padding: 0.5rem 0.55rem;
+  }
+
+  .entry-diagnostics strong {
+    font-size: 0.68rem;
+  }
+
   .decision-line {
     grid-template-columns: 1fr;
     gap: 0.25rem;
@@ -2549,6 +2604,12 @@ main,
   }
 
   .market-metrics {
+    gap: 0.32rem;
+    padding-top: 0.42rem;
+    padding-bottom: 0.42rem;
+  }
+
+  .entry-diagnostics {
     gap: 0.32rem;
     padding-top: 0.42rem;
     padding-bottom: 0.42rem;

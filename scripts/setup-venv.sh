@@ -17,5 +17,8 @@ python -m pip install -r requirements.txt
 if [ -f dashboard/requirements.txt ]; then
   python -m pip install -r dashboard/requirements.txt
 fi
+if [ -f requirements-dev.txt ]; then
+  python -m pip install -r requirements-dev.txt
+fi
 
-echo "OK: venv ready (.venv), bot dependencies installed, dashboard dependencies installed"
+echo "OK: venv ready (.venv), bot dependencies installed, dashboard dependencies installed, dev dependencies installed"

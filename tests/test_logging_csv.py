@@ -39,6 +39,8 @@ def test_trade_csv_accepts_new_diagnostic_columns(tmp_path):
     assert "roundtrip_cost_pct" in reader.fieldnames
     assert "expected_net_edge_pct" in reader.fieldnames
     assert "entry_cross_spread" in reader.fieldnames
+    assert "entry_gate_trace" in reader.fieldnames
+    assert "blocking_reason" in reader.fieldnames
     assert set(TRADE_CSV_FIELDNAMES).issubset(set(reader.fieldnames))
     assert row["event"] == "ORDER_FINAL"
     assert row["client_order_id"] == "aifout_buy_btcusdc_1"

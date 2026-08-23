@@ -4,10 +4,12 @@ Kraken AiFout Bot Dashboard — Flask application
 Serves the trading dashboard UI and API endpoints.
 """
 
+import csv
 import json
 import logging
 import os
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
@@ -490,12 +492,15 @@ def _get_position() -> Optional[dict]:
     return pos
 
 
-def _get_wallet_summary(symbol: str) -> dict:
+def _get_wallet_summary(symbol: str, quote_asset: str = "USDC") -> dict:
     wallet = safe_read_json(RUNTIME_DIR / "wallet.json")
     balances = wallet.get("balances") if isinstance(wallet, dict) else []
-    base_asset = str(symbol or "").upper().removesuffix("USDC")
+    quote_asset = str(quote_asset or "USDC").upper()
+    base_asset = str(symbol or "").upper().removesuffix(quote_asset)
     summary = {
         "ts": wallet.get("ts") if isinstance(wallet, dict) else None,
+        "quote_asset": quote_asset,
+        "quote_free": 0.0,
         "usdc_free": 0.0,
         "base_asset": base_asset,
         "base_free": 0.0,
@@ -503,8 +508,11 @@ def _get_wallet_summary(symbol: str) -> dict:
     }
     for balance in balances or []:
         asset = str(balance.get("asset", "")).upper()
-        if asset == "USDC":
-            summary["usdc_free"] = float(balance.get("free", 0.0) or 0.0)
+        if asset == quote_asset:
+            free = float(balance.get("free", 0.0) or 0.0)
+            summary["quote_free"] = free
+            if quote_asset == "USDC":
+                summary["usdc_free"] = free
         elif asset == base_asset:
             summary["base_free"] = float(balance.get("free", 0.0) or 0.0)
             summary["base_locked"] = float(balance.get("locked", 0.0) or 0.0)
@@ -561,6 +569,23 @@ def _parse_decision_line(line: str) -> dict:
     }
 
 
+def _parse_entry_gate_trace(line: str) -> dict:
+    marker = "ENTRY_GATE_TRACE "
+    if marker not in line:
+        return {}
+    values = {}
+    for key, value in re.findall(r"\b([A-Za-z][A-Za-z0-9_]*)=([^\s]+)", line.split(marker, 1)[1]):
+        if value == "na":
+            values[key] = None
+            continue
+        if value in {"0", "1"}:
+            values[key] = value == "1"
+            continue
+        numeric = _parse_float(value)
+        values[key] = numeric if numeric is not None else value
+    return values
+
+
 def _parse_chk_line(line: str) -> dict:
     return {
         "ts_epoch": _line_ts_epoch(line),
@@ -578,17 +603,21 @@ def _latest_symbol_log(symbol: str) -> Optional[Path]:
 
 def _get_live_monitor(symbol: str) -> dict:
     runtime = safe_read_json(RUNTIME_DIR / "bot_status.json")
+    selector_state = safe_read_json(RUNTIME_DIR / "selector_state.json")
     latest_log = _latest_symbol_log(symbol)
     last_chk = {}
     last_hold = {}
+    last_trace = runtime.get("last_entry_gate_trace") if isinstance(runtime.get("last_entry_gate_trace"), dict) else {}
 
     if latest_log:
         for line in reversed(tail_file(latest_log, 600)):
             if not last_hold and "DECIDE_HOLD reason=" in line:
                 last_hold = _parse_decision_line(line)
+            if not last_trace and "ENTRY_GATE_TRACE " in line:
+                last_trace = _parse_entry_gate_trace(line)
             if not last_chk and "CHK " in line:
                 last_chk = _parse_chk_line(line)
-            if last_hold and last_chk:
+            if last_hold and last_chk and last_trace:
                 break
 
     ts = runtime.get("ts") or last_chk.get("ts_epoch")
@@ -605,17 +634,42 @@ def _get_live_monitor(symbol: str) -> dict:
         "ts_epoch": ts,
         "age_sec": round(age_sec, 1) if age_sec is not None else None,
         "log_file": str(latest_log.relative_to(LOG_DIR)) if latest_log else "",
+        "quote_asset": runtime.get("quote_asset") or "USDC",
+        "quote_free": runtime.get("quote_free"),
+        "min_notional": runtime.get("min_notional"),
+        "sizing_cap": runtime.get("sizing_cap"),
+        "can_buy": runtime.get("can_buy"),
+        "blocking_reason": runtime.get("blocking_reason") or "",
+        "last_hold_reason": runtime.get("last_hold_reason") or "",
     }
     decision_age = None
     if last_hold.get("ts_epoch"):
         decision_age = max(0.0, time.time() - float(last_hold["ts_epoch"]))
+    blocking_reason = metrics["blocking_reason"]
+    if blocking_reason:
+        decision_reason = blocking_reason
+        decision_detail = (
+            f"quote_free={metrics['quote_free']} {metrics['quote_asset']} "
+            f"min_notional={metrics['min_notional']} sizing_cap={metrics['sizing_cap']}"
+        )
+    else:
+        decision_reason = last_hold.get("reason") or runtime.get("last_hold_reason") or (
+            "NO_ENTRY_SIGNAL" if metrics["state"] == "IDLE" else ""
+        )
+        decision_detail = last_hold.get("detail", "")
     decision = {
-        "reason": last_hold.get("reason") or ("NO_ENTRY_SIGNAL" if metrics["state"] == "IDLE" else ""),
-        "detail": last_hold.get("detail", ""),
+        "reason": decision_reason,
+        "detail": decision_detail,
         "age_sec": round(decision_age, 1) if decision_age is not None else None,
         "ts_epoch": last_hold.get("ts_epoch"),
+        "entry_gate_trace": last_trace,
     }
-    return {"metrics": metrics, "decision": decision, "runtime": runtime}
+    return {
+        "metrics": metrics,
+        "decision": decision,
+        "runtime": runtime,
+        "selector_state": selector_state,
+    }
 
 
 def _get_trades(limit: int = 500) -> list:
@@ -626,6 +680,32 @@ def _get_trades(limit: int = 500) -> list:
         return rows
     except Exception:
         return []
+
+
+def _get_execution_summary() -> dict:
+    events = Counter()
+    hold_reasons = Counter()
+    try:
+        paths = glob.glob(str(LOG_DIR / "**" / "*.csv"), recursive=True)
+        for raw_path in paths:
+            with open(raw_path, newline="", encoding="utf-8", errors="replace") as handle:
+                for row in csv.DictReader(handle):
+                    event = str(row.get("event") or "")
+                    if not event:
+                        continue
+                    events[event] += 1
+                    if event == "DECIDE_HOLD":
+                        reason = str(row.get("reason") or "UNKNOWN").split()[0]
+                        hold_reasons[reason] += 1
+    except (OSError, csv.Error):
+        pass
+    order_attempts = sum(count for event, count in events.items() if "ORDER" in event or event.startswith("BUY") or event.startswith("SELL"))
+    return {
+        "trades_executed": events.get("BUY_FILLED", 0),
+        "order_attempts": order_attempts,
+        "holds_total": events.get("DECIDE_HOLD", 0),
+        "holds_by_reason": dict(hold_reasons.most_common(5)),
+    }
 
 
 def _build_pnl_buckets(trades: list, fx: Optional[float]) -> dict:
@@ -679,6 +759,7 @@ def api_status():
     symbol, profile, dry_run = detect_symbol_profile()
     unit_state = read_unit_state("kraken-aifout-bot.service")
     pos = _get_position()
+    monitor = _get_live_monitor(symbol)
     return jsonify({
         "state": unit_state.get("state", "unknown"),
         "since": unit_state.get("since", ""),
@@ -686,6 +767,8 @@ def api_status():
         "profile": profile,
         "dry_run": dry_run,
         "position": pos,
+        "runtime": monitor["runtime"],
+        "monitor": monitor,
     })
 
 
@@ -855,8 +938,8 @@ def api_snapshot():
         unit_state = read_unit_state("kraken-aifout-bot.service")
         pos = _get_position()
         portfolio = safe_read_json(RUNTIME_DIR / "portfolio.json")
-        wallet_summary = _get_wallet_summary(symbol)
         monitor = _get_live_monitor(symbol)
+        wallet_summary = _get_wallet_summary(symbol, monitor["metrics"].get("quote_asset") or "USDC")
         pnl_rows = extract_closed_pnl_rows(trades)
         stats_data = compute_stats(trades)
         streaks = compute_streaks(pnl_rows)
@@ -878,6 +961,8 @@ def api_snapshot():
             "portfolio": portfolio,
             "wallet": wallet_summary,
             "monitor": monitor,
+            "selector_state": monitor["selector_state"],
+            "execution": _get_execution_summary(),
             "pnl": _build_pnl_buckets(trades, fx),
             "stats": {
                 **stats_data,
