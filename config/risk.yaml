@@ -626,3 +626,24 @@ entryGuard:
   givebackPct: 0.0015
   lossCutPct: 0.0015
   lossAgeSec: 12.0
+
+# ── Dashboard Favoris (lecture seule, sans effet sur le trading) ─────────────
+dashboard:
+  favorites:
+    minimum_samples_per_range: 2
+    minimum_range_coverage_pct: 0.8
+    history_limit_per_favorite: 3000
+    freshness_sec: 1800
+    near_high_pct: 0.006
+    return_from_low_pct: 0.02
+    acceleration_5m_pct: 0.004
+    calm_change_pct: 0.001
+    tight_range_pct: 0.006
+    high_volatility_pct: 0.06
+    noisy_risk_score: 55
+    scalping_clean_max_spread_pct: 0.001
+    scalping_acceptable_max_spread_pct: 0.0025
+    scalping_low_quote_volume_24h: 250000
+    scalping_good_quote_volume_24h: 1000000
+    scalping_clean_reliability_score: 70
+    history_min_trades_for_signal: 3

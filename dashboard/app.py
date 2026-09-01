@@ -708,6 +708,11 @@ def _get_execution_summary() -> dict:
     }
 
 
+from dashboard.routes_favorites import register_favorites_routes
+
+register_favorites_routes(app, require_basic_auth, BASE_DIR, logs_trades_loader=lambda: _get_trades())
+
+
 def _build_pnl_buckets(trades: list, fx: Optional[float]) -> dict:
     now = datetime.now(timezone.utc)
     buckets = {

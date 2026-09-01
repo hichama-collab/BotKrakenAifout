@@ -1,0 +1,208 @@
+{% extends 'base.html' %}
+{% block title %}Favoris{% endblock %}
+
+{% block head_extra %}
+<link rel="stylesheet" href="/static/favorites.css?v=20260901a" />
+{% endblock %}
+
+{% block content %}
+<div x-data="favoriteDashboard()" x-init="init()" class="page-content favorites-page">
+  <section class="favorites-head" aria-labelledby="favorites-title">
+    <div>
+      <h1 id="favorites-title">Favoris</h1>
+      <p x-text="freshnessText()"></p>
+    </div>
+    <button class="favorites-refresh" type="button" @click="refresh()" :disabled="loading" title="Actualiser" aria-label="Actualiser">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" :class="{'is-spinning': loading}">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.58m14.84 2A7 7 0 005.58 9M20 20v-5h-.58m0 0A7 7 0 014.16 13"/>
+      </svg>
+    </button>
+  </section>
+
+  <div x-show="error" x-cloak class="favorites-error" x-text="error"></div>
+
+  <section class="favorites-summary" x-show="!loading" x-cloak aria-label="Résumé des favoris">
+    <div class="favorite-summary-cell">
+      <span>À surveiller</span>
+      <button type="button" @click="selectSummary(summary.best_to_watch)" :disabled="!summary.best_to_watch">
+        <strong x-text="summarySymbol(summary.best_to_watch)"></strong>
+        <small x-text="summaryLabel(summary.best_to_watch)"></small>
+      </button>
+    </div>
+    <div class="favorite-summary-cell">
+      <span>Le plus actif</span>
+      <button type="button" @click="selectSummary(summary.most_active)" :disabled="!summary.most_active">
+        <strong x-text="summarySymbol(summary.most_active)"></strong>
+        <small :class="changeClass(summaryChange(summary.most_active))" x-text="pct(summaryChange(summary.most_active))"></small>
+      </button>
+    </div>
+    <div class="favorite-summary-cell">
+      <span>Le plus calme</span>
+      <button type="button" @click="selectSummary(summary.calmest)" :disabled="!summary.calmest">
+        <strong x-text="summarySymbol(summary.calmest)"></strong>
+        <small x-text="summaryLabel(summary.calmest)"></small>
+      </button>
+    </div>
+    <div class="favorite-summary-cell">
+      <span>Le plus volatil</span>
+      <button type="button" @click="selectSummary(summary.most_volatile)" :disabled="!summary.most_volatile">
+        <strong x-text="summarySymbol(summary.most_volatile)"></strong>
+        <small x-text="behaviorText(summary.most_volatile)"></small>
+      </button>
+    </div>
+    <div class="favorite-summary-cell">
+      <span>Vigilance</span>
+      <button type="button" @click="selectSummary(summary.most_risky)" :disabled="!summary.most_risky">
+        <strong x-text="summarySymbol(summary.most_risky)"></strong>
+        <small x-text="riskText(summary.most_risky)"></small>
+      </button>
+    </div>
+    <div class="favorite-summary-cell favorites-count">
+      <span>Suivis</span>
+      <strong class="num" x-text="summary.followed_count || 0"></strong>
+      <small x-text="freshnessState()"></small>
+    </div>
+  </section>
+
+  <section x-show="loading" class="favorites-loading" aria-label="Chargement">
+    <div></div><div></div><div></div>
+  </section>
+
+  <section x-show="!loading && items.length === 0" x-cloak class="favorites-empty">
+    <strong>no data</strong>
+    <span>Aucun favori actif dans le radar.</span>
+  </section>
+
+  <div x-show="!loading && items.length" x-cloak class="favorites-layout">
+    <section class="favorites-list-panel" aria-labelledby="favorites-list-title">
+      <header class="favorites-section-heading">
+        <div>
+          <h2 id="favorites-list-title">Lecture des favoris</h2>
+          <span x-text="`${items.length} suivi${items.length > 1 ? 's' : ''}`"></span>
+        </div>
+      </header>
+
+      <div class="favorites-list">
+        <template x-for="item in items" :key="item.symbol">
+          <button type="button" class="favorite-row-analysis" :class="{'is-selected': selectedSymbol === item.symbol}" @click="select(item.symbol)">
+            <div class="favorite-row-title">
+              <strong x-text="formatSymbol(item.symbol)"></strong>
+              <span class="favorite-verdict" :class="verdictClass(item.verdict)" x-text="item.verdict"></span>
+            </div>
+            <div class="favorite-row-price">
+              <strong class="num" x-text="price(item.current_price)"></strong>
+              <span :class="changeClass(item.changes?.change_1h_pct)" x-text="pct(item.changes?.change_1h_pct)"></span>
+            </div>
+            <p x-text="rowSentence(item)"></p>
+            <div class="favorite-row-meta">
+              <span x-text="behaviorText(item)"></span>
+              <span x-text="scalpingText(item)"></span>
+              <span x-text="freshnessItemText(item)"></span>
+            </div>
+          </button>
+        </template>
+      </div>
+    </section>
+
+    <section class="favorite-detail-panel" aria-live="polite">
+      <template x-if="selected">
+        <div>
+          <header class="favorite-detail-head">
+            <div>
+              <div class="favorite-detail-symbol-line">
+                <h2 x-text="formatSymbol(selected.symbol)"></h2>
+                <span class="favorite-verdict" :class="verdictClass(selected.verdict)" x-text="selected.verdict"></span>
+              </div>
+              <span x-text="freshnessItemText(selected)"></span>
+            </div>
+            <strong class="num favorite-current-price" x-text="price(selected.current_price)"></strong>
+          </header>
+
+          <div class="favorite-sparkline" x-show="selected.series?.length >= 2">
+            <svg viewBox="0 0 240 64" preserveAspectRatio="none" aria-hidden="true">
+              <polyline :points="sparklinePoints()" fill="none" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke"></polyline>
+            </svg>
+          </div>
+
+          <section class="favorite-detail-block" aria-labelledby="range-title">
+            <header class="favorite-detail-block-head">
+              <h3 id="range-title">Min / max par durée</h3>
+              <span>prix observés</span>
+            </header>
+            <div class="favorite-ranges">
+              <template x-for="period in rangePeriods" :key="period">
+                <div class="favorite-range-row" :class="{'is-unavailable': !selected.ranges?.[period]?.available}">
+                  <span x-text="period"></span>
+                  <strong class="num" x-text="selected.ranges?.[period]?.available ? `${price(selected.ranges[period].min)} – ${price(selected.ranges[period].max)}` : 'no data'"></strong>
+                  <em x-text="rangePositionText(selected.ranges?.[period])"></em>
+                </div>
+              </template>
+            </div>
+          </section>
+
+          <section class="favorite-detail-block favorite-detail-two-col">
+            <div>
+              <header class="favorite-detail-block-head">
+                <h3>Comportement</h3>
+                <span x-text="selected.behavior?.summary || 'no data'"></span>
+              </header>
+              <div class="favorite-tags">
+                <template x-for="label in selected.behavior?.labels || []" :key="label">
+                  <span x-text="label"></span>
+                </template>
+              </div>
+              <dl class="favorite-facts">
+                <div><dt>5 min</dt><dd :class="changeClass(selected.changes?.change_5m_pct)" x-text="pct(selected.changes?.change_5m_pct)"></dd></div>
+                <div><dt>1 h</dt><dd :class="changeClass(selected.changes?.change_1h_pct)" x-text="pct(selected.changes?.change_1h_pct)"></dd></div>
+                <div><dt>24 h</dt><dd :class="changeClass(selected.changes?.change_24h_pct)" x-text="pct(selected.changes?.change_24h_pct)"></dd></div>
+              </dl>
+            </div>
+            <div>
+              <header class="favorite-detail-block-head">
+                <h3>Qualité scalping</h3>
+                <span :class="scalpingClass(selected.scalping_quality?.grade)" x-text="selected.scalping_quality?.label || 'no data'"></span>
+              </header>
+              <p class="favorite-copy" x-text="selected.scalping_quality?.reason || 'no data'"></p>
+              <dl class="favorite-facts">
+                <div><dt>Spread</dt><dd x-text="pct(selected.market?.spread_pct)"></dd></div>
+                <div><dt>Volume 24 h</dt><dd x-text="compact(selected.market?.quote_volume_24h)"></dd></div>
+                <div><dt>Risque</dt><dd x-text="riskText(selected)"></dd></div>
+              </dl>
+            </div>
+          </section>
+
+          <section class="favorite-detail-block" aria-labelledby="history-title">
+            <header class="favorite-detail-block-head">
+              <h3 id="history-title">Historique personnel du bot</h3>
+              <span :class="historyClass(selected.bot_history)" x-text="selected.bot_history?.assessment || 'no bot trade history'"></span>
+            </header>
+            <template x-if="selected.bot_history?.available">
+              <div class="favorite-history-grid">
+                <div><span>Trades complets</span><strong class="num" x-text="selected.bot_history.complete_trades"></strong></div>
+                <div><span>PnL net</span><strong class="num" :class="changeClass(selected.bot_history.net_pnl_usdc)" x-text="usdc(selected.bot_history.net_pnl_usdc)"></strong></div>
+                <div><span>Meilleur</span><strong class="num profit" x-text="usdc(selected.bot_history.best_trade_usdc)"></strong></div>
+                <div><span>Pire</span><strong class="num loss" x-text="usdc(selected.bot_history.worst_trade_usdc)"></strong></div>
+                <div><span>Dernière activité</span><strong x-text="date(selected.bot_history.last_activity)"></strong></div>
+                <div><span>Sorties fréquentes</span><strong x-text="exitText(selected.bot_history.frequent_exits)"></strong></div>
+              </div>
+            </template>
+            <template x-if="!selected.bot_history?.available">
+              <p class="favorite-no-history">no bot trade history</p>
+            </template>
+          </section>
+
+          <section class="favorite-detail-block favorite-missing" x-show="missingFields(selected).length">
+            <header class="favorite-detail-block-head"><h3>Données manquantes</h3></header>
+            <span x-text="missingFields(selected).join(' · ')"></span>
+          </section>
+        </div>
+      </template>
+      <div x-show="!selected" class="favorites-detail-empty">no data</div>
+    </section>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/favorites.js?v=20260901a"></script>
+{% endblock %}

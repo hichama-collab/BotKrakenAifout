@@ -433,3 +433,35 @@ def get_token_detail(
         "latest": _row_to_dict(latest),
         "history": [dict(row) for row in history],
     }
+
+
+def get_token_snapshot_history(
+    symbol: str,
+    *,
+    limit: int = 3000,
+    db_path: str | Path | None = None,
+    base_dir: str | Path | None = None,
+) -> list[dict]:
+    """Return ordered radar snapshots for one symbol.
+
+    This is intentionally a read helper for dashboard views. The scanner keeps
+    owning writes, and callers can restrict the query to user-selected tokens.
+    """
+    normalized = str(symbol or "").upper().replace("/", "").replace("-", "")
+    if not normalized:
+        return []
+    with connect(db_path, base_dir) as conn:
+        ensure_schema(conn)
+        rows = conn.execute(
+            """
+            SELECT * FROM (
+                SELECT * FROM token_snapshots
+                 WHERE symbol = ?
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT ?
+            )
+            ORDER BY created_at ASC, id ASC
+            """,
+            (normalized, max(1, min(int(limit), 10000))),
+        ).fetchall()
+    return [dict(row) for row in rows]

@@ -41,6 +41,16 @@
     <span>Radar</span>
   </a>
 
+  <a href="/favorites"
+     class="bottom-nav-item {% if request.path == '/favorites' %}active{% endif %}"
+     aria-label="Favoris">
+    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+      <path stroke-linecap="round" stroke-linejoin="round"
+            d="M11.48 3.5a.6.6 0 011.04 0l2.58 5.23 5.77.84a.6.6 0 01.33 1.02l-4.17 4.07.98 5.74a.6.6 0 01-.87.63L12 18.3l-5.16 2.72a.6.6 0 01-.87-.63l.98-5.74-4.17-4.07a.6.6 0 01.33-1.02l5.77-.84 2.6-5.23z"/>
+    </svg>
+    <span>Favoris</span>
+  </a>
+
   <a href="/logs"
      class="bottom-nav-item {% if request.path == '/logs' %}active{% endif %}"
      aria-label="Logs">
