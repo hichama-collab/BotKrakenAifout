@@ -268,8 +268,9 @@ def test_favorites_routes_render_and_return_safe_json(tmp_path, monkeypatch):
 
     assert page.status_code == 200
     assert b"Favoris" in page.data
-    assert b'x-data="favoriteDashboard"' in page.data
-    assert b"favorites.js?v=20260901b" in page.data
+    assert b"HNT/USD" in page.data
+    assert b"favorite-server-item" in page.data
+    assert b"favorites-loading" not in page.data
     assert overview.status_code == 200
     assert overview.get_json()["items"][0]["symbol"] == "HNTUSD"
     assert detail.status_code == 200

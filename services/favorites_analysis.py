@@ -354,6 +354,7 @@ def _build_item(favorite: Mapping, history: list[dict], trades: Iterable[Mapping
         "market": {
             "spread_pct": _pct(latest.get("spread_pct")) if latest else None,
             "quote_volume_24h": _number(latest.get("quote_volume_24h")) if latest else None,
+            "trade_count_24h": int(_number(latest.get("trade_count_24h"))) if latest and _number(latest.get("trade_count_24h")) is not None else None,
             "volatility_pct": _pct(
                 (latest or {}).get("volatility_pct")
                 if (latest or {}).get("volatility_pct") is not None

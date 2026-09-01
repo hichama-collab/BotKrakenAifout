@@ -2,207 +2,193 @@
 {% block title %}Favoris{% endblock %}
 
 {% block head_extra %}
-<link rel="stylesheet" href="/static/favorites.css?v=20260901a" />
+<link rel="stylesheet" href="/static/favorites.css?v=20260901c" />
 {% endblock %}
 
+{% macro price(value) -%}
+  {%- if value is none -%}—
+  {%- elif value >= 1000 -%}{{ '{:,.2f}'.format(value) }}
+  {%- elif value >= 1 -%}{{ '%.4f'|format(value) }}
+  {%- else -%}{{ '%.6f'|format(value) }}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro pct(value) -%}
+  {%- if value is none -%}—
+  {%- else -%}{{ '%+.2f%%'|format(value * 100) }}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro compact(value) -%}
+  {%- if value is none -%}—
+  {%- elif value >= 1000000 -%}{{ '%.2f M'|format(value / 1000000) }}
+  {%- elif value >= 1000 -%}{{ '%.1f K'|format(value / 1000) }}
+  {%- else -%}{{ '%.0f'|format(value) }}
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro sign_class(value) -%}
+  {%- if value is not none and value > 0 -%}profit
+  {%- elif value is not none and value < 0 -%}loss
+  {%- else -%}neutral
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro verdict_class(value) -%}
+  {%- if value == 'intéressant' -%}is-interesting
+  {%- elif value == 'à surveiller' -%}is-watch
+  {%- elif value in ('calme', 'données insuffisantes', 'données anciennes') -%}is-calm
+  {%- else -%}is-risk
+  {%- endif -%}
+{%- endmacro %}
+
 {% block content %}
-<div x-data="favoriteDashboard" x-init="init()" class="page-content favorites-page">
+<div class="page-content favorites-page">
   <section class="favorites-head" aria-labelledby="favorites-title">
     <div>
       <h1 id="favorites-title">Favoris</h1>
-      <p x-text="freshnessText()"></p>
+      <p>
+        {% if payload.summary.latest_data_at %}
+          Dernière mise à jour : {{ payload.summary.latest_data_at.replace('T', ' ')[:16] }} UTC
+        {% else %}
+          Données de favoris indisponibles
+        {% endif %}
+      </p>
     </div>
-    <button class="favorites-refresh" type="button" @click="refresh()" :disabled="loading" title="Actualiser" aria-label="Actualiser">
-      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" :class="{'is-spinning': loading}">
+    <a class="favorites-refresh" href="{{ url_for('favorites') }}" title="Actualiser" aria-label="Actualiser">
+      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true">
         <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.58m14.84 2A7 7 0 005.58 9M20 20v-5h-.58m0 0A7 7 0 014.16 13"/>
       </svg>
-    </button>
+    </a>
   </section>
 
-  <div x-show="error" x-cloak class="favorites-error" x-text="error"></div>
+  {% if payload.warnings %}
+    <section class="favorites-error" role="status">{{ payload.warnings|join(' · ') }}</section>
+  {% endif %}
 
-  <section class="favorites-summary" x-show="!loading" x-cloak aria-label="Résumé des favoris">
-    <div class="favorite-summary-cell">
-      <span>À surveiller</span>
-      <button type="button" @click="selectSummary(summary.best_to_watch)" :disabled="!summary.best_to_watch">
-        <strong x-text="summarySymbol(summary.best_to_watch)"></strong>
-        <small x-text="summaryLabel(summary.best_to_watch)"></small>
-      </button>
-    </div>
-    <div class="favorite-summary-cell">
-      <span>Le plus actif</span>
-      <button type="button" @click="selectSummary(summary.most_active)" :disabled="!summary.most_active">
-        <strong x-text="summarySymbol(summary.most_active)"></strong>
-        <small :class="changeClass(summaryChange(summary.most_active))" x-text="pct(summaryChange(summary.most_active))"></small>
-      </button>
-    </div>
-    <div class="favorite-summary-cell">
-      <span>Le plus calme</span>
-      <button type="button" @click="selectSummary(summary.calmest)" :disabled="!summary.calmest">
-        <strong x-text="summarySymbol(summary.calmest)"></strong>
-        <small x-text="summaryLabel(summary.calmest)"></small>
-      </button>
-    </div>
-    <div class="favorite-summary-cell">
-      <span>Le plus volatil</span>
-      <button type="button" @click="selectSummary(summary.most_volatile)" :disabled="!summary.most_volatile">
-        <strong x-text="summarySymbol(summary.most_volatile)"></strong>
-        <small x-text="behaviorText(summary.most_volatile)"></small>
-      </button>
-    </div>
-    <div class="favorite-summary-cell">
-      <span>Vigilance</span>
-      <button type="button" @click="selectSummary(summary.most_risky)" :disabled="!summary.most_risky">
-        <strong x-text="summarySymbol(summary.most_risky)"></strong>
-        <small x-text="riskText(summary.most_risky)"></small>
-      </button>
-    </div>
+  <section class="favorites-summary" aria-label="Résumé des favoris">
+    {% set summary_items = [
+      ('À surveiller', payload.summary.best_to_watch, 'verdict'),
+      ('Le plus actif', payload.summary.most_active, 'change'),
+      ('Le plus calme', payload.summary.calmest, 'behavior'),
+      ('Le plus volatil', payload.summary.most_volatile, 'behavior'),
+      ('Vigilance', payload.summary.most_risky, 'risk')
+    ] %}
+    {% for label, item, kind in summary_items %}
+      <div class="favorite-summary-cell">
+        <span>{{ label }}</span>
+        {% if item %}
+          <strong>{{ item.display_symbol }}</strong>
+          {% if kind == 'change' %}
+            <small class="{{ sign_class(item.changes.change_5m_pct) }}">{{ pct(item.changes.change_5m_pct) }}</small>
+          {% elif kind == 'behavior' %}
+            <small>{{ item.behavior.summary }}</small>
+          {% elif kind == 'risk' %}
+            <small>{{ item.market.risk_label or item.market.risk_level or 'no data' }}</small>
+          {% else %}
+            <small>{{ item.verdict }}</small>
+          {% endif %}
+        {% else %}
+          <strong>—</strong><small>no data</small>
+        {% endif %}
+      </div>
+    {% endfor %}
     <div class="favorite-summary-cell favorites-count">
       <span>Suivis</span>
-      <strong class="num" x-text="summary.followed_count || 0"></strong>
-      <small x-text="freshnessState()"></small>
+      <strong class="num">{{ payload.summary.followed_count }}</strong>
+      <small>{{ 'données fraîches' if payload.summary.freshness.status == 'fresh' else 'données anciennes' if payload.summary.latest_data_at else 'no data' }}</small>
     </div>
   </section>
 
-  <section x-show="loading" class="favorites-loading" aria-label="Chargement">
-    <div></div><div></div><div></div>
-  </section>
-
-  <section x-show="!loading && items.length === 0" x-cloak class="favorites-empty">
-    <strong>no data</strong>
-    <span>Aucun favori personnel configuré ou aucune donnée disponible.</span>
-  </section>
-
-  <div x-show="!loading && items.length" x-cloak class="favorites-layout">
-    <section class="favorites-list-panel" aria-labelledby="favorites-list-title">
+  {% if not payload['items'] %}
+    <section class="favorites-empty">
+      <strong>no data</strong>
+      <span>Aucun favori personnel configuré ou aucune donnée disponible.</span>
+    </section>
+  {% else %}
+    <section class="favorites-server-list" aria-labelledby="favorites-list-title">
       <header class="favorites-section-heading">
         <div>
           <h2 id="favorites-list-title">Lecture des favoris</h2>
-          <span x-text="`${items.length} suivi${items.length > 1 ? 's' : ''}`"></span>
+          <span>{{ payload['items']|length }} suivi{{ 's' if payload['items']|length > 1 else '' }}</span>
         </div>
       </header>
 
-      <div class="favorites-list">
-        <template x-for="item in items" :key="item.symbol">
-          <button type="button" class="favorite-row-analysis" :class="{'is-selected': selectedSymbol === item.symbol}" @click="select(item.symbol)">
+      {% for item in payload['items'] %}
+        <details class="favorite-server-item" {% if loop.first %}open{% endif %}>
+          <summary>
             <div class="favorite-row-title">
-              <strong x-text="formatSymbol(item.symbol)"></strong>
-              <span class="favorite-verdict" :class="verdictClass(item.verdict)" x-text="item.verdict"></span>
+              <strong>{{ item.display_symbol }}</strong>
+              <span class="favorite-verdict {{ verdict_class(item.verdict) }}">{{ item.verdict }}</span>
             </div>
             <div class="favorite-row-price">
-              <strong class="num" x-text="price(item.current_price)"></strong>
-              <span :class="changeClass(item.changes?.change_1h_pct)" x-text="pct(item.changes?.change_1h_pct)"></span>
+              <strong class="num">{{ price(item.current_price) }}</strong>
+              <span class="{{ sign_class(item.changes.change_1h_pct) }}">{{ pct(item.changes.change_1h_pct) }}</span>
             </div>
-            <p x-text="rowSentence(item)"></p>
-            <div class="favorite-row-meta">
-              <span x-text="behaviorText(item)"></span>
-              <span x-text="scalpingText(item)"></span>
-              <span x-text="freshnessItemText(item)"></span>
-            </div>
-          </button>
-        </template>
-      </div>
-    </section>
+            <p>{{ item.behavior.summary }} · scalping {{ item.scalping_quality.label }} · {{ item.data_error or item.market.risk_label or item.market.risk_level or 'risque no data' }}</p>
+          </summary>
 
-    <section class="favorite-detail-panel" aria-live="polite">
-      <template x-if="selected">
-        <div>
-          <header class="favorite-detail-head">
-            <div>
-              <div class="favorite-detail-symbol-line">
-                <h2 x-text="formatSymbol(selected.symbol)"></h2>
-                <span class="favorite-verdict" :class="verdictClass(selected.verdict)" x-text="selected.verdict"></span>
+          <div class="favorite-server-detail">
+            <section class="favorite-detail-block">
+              <header class="favorite-detail-block-head"><h3>Min / max par durée</h3><span>prix observés</span></header>
+              <div class="favorite-ranges">
+                {% for period in range_periods %}
+                  {% set range = item.ranges.get(period) %}
+                  <div class="favorite-range-row {% if not range.available %}is-unavailable{% endif %}">
+                    <span>{{ period }}</span>
+                    {% if range.available %}
+                      <strong class="num">{{ price(range.min) }} – {{ price(range.max) }}</strong>
+                      <em>{{ '%.0f%%'|format(range.position_in_range_pct) }} dans le range · min {{ pct(range.distance_from_min_pct) }} · max {{ pct(range.distance_to_max_pct) }}</em>
+                    {% else %}
+                      <strong>no data</strong><em>donnée absente</em>
+                    {% endif %}
+                  </div>
+                {% endfor %}
               </div>
-              <span x-text="freshnessItemText(selected)"></span>
-            </div>
-            <strong class="num favorite-current-price" x-text="price(selected.current_price)"></strong>
-          </header>
+            </section>
 
-          <div class="favorite-sparkline" x-show="selected.series?.length >= 2">
-            <svg viewBox="0 0 240 64" preserveAspectRatio="none" aria-hidden="true">
-              <polyline :points="sparklinePoints()" fill="none" stroke="currentColor" stroke-width="2" vector-effect="non-scaling-stroke"></polyline>
-            </svg>
-          </div>
-
-          <section class="favorite-detail-block" aria-labelledby="range-title">
-            <header class="favorite-detail-block-head">
-              <h3 id="range-title">Min / max par durée</h3>
-              <span>prix observés</span>
-            </header>
-            <div class="favorite-ranges">
-              <template x-for="period in rangePeriods" :key="period">
-                <div class="favorite-range-row" :class="{'is-unavailable': !selected.ranges?.[period]?.available}">
-                  <span x-text="period"></span>
-                  <strong class="num" x-text="selected.ranges?.[period]?.available ? `${price(selected.ranges[period].min)} – ${price(selected.ranges[period].max)}` : 'no data'"></strong>
-                  <em x-text="rangePositionText(selected.ranges?.[period])"></em>
+            <section class="favorite-detail-block favorite-detail-two-col">
+              <div>
+                <header class="favorite-detail-block-head"><h3>Comportement</h3><span>{{ item.behavior.summary }}</span></header>
+                <div class="favorite-tags">
+                  {% for label in item.behavior.labels %}<span>{{ label }}</span>{% endfor %}
                 </div>
-              </template>
-            </div>
-          </section>
-
-          <section class="favorite-detail-block favorite-detail-two-col">
-            <div>
-              <header class="favorite-detail-block-head">
-                <h3>Comportement</h3>
-                <span x-text="selected.behavior?.summary || 'no data'"></span>
-              </header>
-              <div class="favorite-tags">
-                <template x-for="label in selected.behavior?.labels || []" :key="label">
-                  <span x-text="label"></span>
-                </template>
+                <dl class="favorite-facts">
+                  <div><dt>5 min</dt><dd class="{{ sign_class(item.changes.change_5m_pct) }}">{{ pct(item.changes.change_5m_pct) }}</dd></div>
+                  <div><dt>1 h</dt><dd class="{{ sign_class(item.changes.change_1h_pct) }}">{{ pct(item.changes.change_1h_pct) }}</dd></div>
+                  <div><dt>24 h</dt><dd class="{{ sign_class(item.changes.change_24h_pct) }}">{{ pct(item.changes.change_24h_pct) }}</dd></div>
+                </dl>
               </div>
-              <dl class="favorite-facts">
-                <div><dt>5 min</dt><dd :class="changeClass(selected.changes?.change_5m_pct)" x-text="pct(selected.changes?.change_5m_pct)"></dd></div>
-                <div><dt>1 h</dt><dd :class="changeClass(selected.changes?.change_1h_pct)" x-text="pct(selected.changes?.change_1h_pct)"></dd></div>
-                <div><dt>24 h</dt><dd :class="changeClass(selected.changes?.change_24h_pct)" x-text="pct(selected.changes?.change_24h_pct)"></dd></div>
-              </dl>
-            </div>
-            <div>
-              <header class="favorite-detail-block-head">
-                <h3>Qualité scalping</h3>
-                <span :class="scalpingClass(selected.scalping_quality?.grade)" x-text="selected.scalping_quality?.label || 'no data'"></span>
-              </header>
-              <p class="favorite-copy" x-text="selected.scalping_quality?.reason || 'no data'"></p>
-              <dl class="favorite-facts">
-                <div><dt>Spread</dt><dd x-text="pct(selected.market?.spread_pct)"></dd></div>
-                <div><dt>Volume 24 h</dt><dd x-text="compact(selected.market?.quote_volume_24h)"></dd></div>
-                <div><dt>Risque</dt><dd x-text="riskText(selected)"></dd></div>
-              </dl>
-            </div>
-          </section>
-
-          <section class="favorite-detail-block" aria-labelledby="history-title">
-            <header class="favorite-detail-block-head">
-              <h3 id="history-title">Historique personnel du bot</h3>
-              <span :class="historyClass(selected.bot_history)" x-text="selected.bot_history?.assessment || 'no bot trade history'"></span>
-            </header>
-            <template x-if="selected.bot_history?.available">
-              <div class="favorite-history-grid">
-                <div><span>Trades complets</span><strong class="num" x-text="selected.bot_history.complete_trades"></strong></div>
-                <div><span>PnL net</span><strong class="num" :class="changeClass(selected.bot_history.net_pnl_usdc)" x-text="usdc(selected.bot_history.net_pnl_usdc)"></strong></div>
-                <div><span>Meilleur</span><strong class="num profit" x-text="usdc(selected.bot_history.best_trade_usdc)"></strong></div>
-                <div><span>Pire</span><strong class="num loss" x-text="usdc(selected.bot_history.worst_trade_usdc)"></strong></div>
-                <div><span>Dernière activité</span><strong x-text="date(selected.bot_history.last_activity)"></strong></div>
-                <div><span>Sorties fréquentes</span><strong x-text="exitText(selected.bot_history.frequent_exits)"></strong></div>
+              <div>
+                <header class="favorite-detail-block-head"><h3>Qualité scalping</h3><span class="scalping-{{ item.scalping_quality.grade }}">{{ item.scalping_quality.label }}</span></header>
+                <p class="favorite-copy">{{ item.scalping_quality.reason }}</p>
+                <dl class="favorite-facts">
+                  <div><dt>Spread</dt><dd>{{ pct(item.market.spread_pct) }}</dd></div>
+                  <div><dt>Volume 24 h</dt><dd>{{ compact(item.market.quote_volume_24h) }} {{ item.quote_asset }}</dd></div>
+                  <div><dt>Trades 24 h</dt><dd>{{ item.market.trade_count_24h if item.market.trade_count_24h is not none else '—' }}</dd></div>
+                </dl>
               </div>
-            </template>
-            <template x-if="!selected.bot_history?.available">
-              <p class="favorite-no-history">no bot trade history</p>
-            </template>
-          </section>
+            </section>
 
-          <section class="favorite-detail-block favorite-missing" x-show="missingFields(selected).length">
-            <header class="favorite-detail-block-head"><h3>Données manquantes</h3></header>
-            <span x-text="missingFields(selected).join(' · ')"></span>
-          </section>
-        </div>
-      </template>
-      <div x-show="!selected" class="favorites-detail-empty">no data</div>
+            <section class="favorite-detail-block">
+              <header class="favorite-detail-block-head"><h3>Historique personnel du bot</h3><span class="history-{{ 'none' if not item.bot_history.available else 'limited' }}">{{ item.bot_history.assessment }}</span></header>
+              {% if item.bot_history.available %}
+                <div class="favorite-history-grid">
+                  <div><span>Trades complets</span><strong class="num">{{ item.bot_history.complete_trades }}</strong></div>
+                  <div><span>PnL net</span><strong class="num {{ sign_class(item.bot_history.net_pnl_usdc) }}">{{ '%.4f USDC'|format(item.bot_history.net_pnl_usdc) if item.bot_history.net_pnl_usdc is not none else '—' }}</strong></div>
+                  <div><span>Meilleur</span><strong class="num profit">{{ '%.4f USDC'|format(item.bot_history.best_trade_usdc) if item.bot_history.best_trade_usdc is not none else '—' }}</strong></div>
+                  <div><span>Pire</span><strong class="num loss">{{ '%.4f USDC'|format(item.bot_history.worst_trade_usdc) if item.bot_history.worst_trade_usdc is not none else '—' }}</strong></div>
+                  <div><span>Dernière activité</span><strong>{{ item.bot_history.last_activity or '—' }}</strong></div>
+                  <div><span>Sorties fréquentes</span><strong>{{ item.bot_history.frequent_exits|map(attribute='reason')|join(', ') or '—' }}</strong></div>
+                </div>
+              {% else %}
+                <p class="favorite-no-history">no bot trade history</p>
+              {% endif %}
+            </section>
+          </div>
+        </details>
+      {% endfor %}
     </section>
-  </div>
+  {% endif %}
 </div>
-{% endblock %}
-
-{% block scripts %}
-<script src="/static/favorites.js?v=20260901b"></script>
 {% endblock %}

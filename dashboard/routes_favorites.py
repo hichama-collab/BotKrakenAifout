@@ -30,22 +30,28 @@ def register_favorites_routes(app, require_basic_auth, base_dir, logs_trades_loa
         except Exception:
             return []
 
-    @app.route("/favorites")
-    @require_basic_auth
-    def favorites():
-        return render_template("favorites.html")
-
-    @app.route("/api/favorites")
-    @require_basic_auth
-    def api_favorites():
-        payload = build_dashboard_favorites_analysis(
+    def _payload():
+        return build_dashboard_favorites_analysis(
             watchlist_path=watchlist_path,
             history_db_path=history_db_path,
             risk_yaml_path=risk_path,
             trades=_trades(),
             kraken_base_url=kraken_base_url,
         )
-        return jsonify({"ok": True, **payload})
+
+    @app.route("/favorites")
+    @require_basic_auth
+    def favorites():
+        return render_template(
+            "favorites.html",
+            payload=_payload(),
+            range_periods=("5m", "15m", "1h", "4h", "24h", "7d"),
+        )
+
+    @app.route("/api/favorites")
+    @require_basic_auth
+    def api_favorites():
+        return jsonify({"ok": True, **_payload()})
 
     @app.route("/api/favorites/<symbol>")
     @require_basic_auth
