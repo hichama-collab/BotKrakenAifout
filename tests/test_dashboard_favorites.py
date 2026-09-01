@@ -8,8 +8,48 @@ import pytest
 
 pytest.importorskip("flask")
 
-from services.favorites_analysis import build_favorite_detail, build_favorites_analysis
+from services.favorites_analysis import (
+    build_dashboard_favorite_detail,
+    build_dashboard_favorites_analysis,
+    build_favorite_detail,
+    build_favorites_analysis,
+)
 from services.token_radar_store import add_favorite, insert_snapshots
+
+
+class _FavoriteKrakenStub:
+    """Public API fixture: no test reaches Kraken."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def get(self, path, params=None):
+        if path == "/0/public/AssetPairs":
+            return {
+                "HNTUSD": {
+                    "base": "HNT",
+                    "quote": "ZUSD",
+                    "altname": "HNTUSD",
+                    "wsname": "HNT/USD",
+                    "pair_decimals": 5,
+                    "lot_decimals": 8,
+                    "ordermin": "0.1",
+                }
+            }
+        if path == "/0/public/Ticker":
+            return {
+                "HNTUSD": {
+                    "a": ["0.73700"],
+                    "b": ["0.73600"],
+                    "c": ["0.73650"],
+                    "v": ["1000", "2500000"],
+                    "p": ["0.73", "0.72"],
+                    "t": [100, 6500],
+                    "l": ["0.60", "0.59"],
+                    "h": ["0.75", "0.88"],
+                }
+            }
+        raise AssertionError(f"Unexpected public endpoint: {path}")
 
 
 @pytest.fixture(autouse=True)
@@ -73,6 +113,21 @@ def _seed_favorite(db_path, now: datetime, symbol="SOLUSDC"):
     ]
     insert_snapshots([_snapshot(symbol, created_at, price) for created_at, price in points], db_path)
     add_favorite(symbol, note="suivi", db_path=db_path)
+
+
+def _write_dashboard_watchlist(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """settings:
+  snapshot_interval_sec: 60
+  retention_days: 14
+  request_timeout_sec: 1
+  history_limit: 300
+favorites:
+  - HNT/USD
+""",
+        encoding="utf-8",
+    )
 
 
 def _import_dashboard_app(tmp_path, monkeypatch):
@@ -147,26 +202,76 @@ def test_favorites_uses_ticker_24h_range_when_local_history_is_too_short(tmp_pat
     assert item["ranges"]["7d"]["available"] is False
 
 
+def test_dashboard_watchlist_is_independent_from_radar_and_uses_public_ticker(tmp_path, monkeypatch):
+    import services.favorites_store as favorites_store
+
+    monkeypatch.setattr(favorites_store, "Kraken", _FavoriteKrakenStub)
+    watchlist_path = tmp_path / "config" / "dashboard_favorites.yaml"
+    history_db_path = tmp_path / "runtime" / "favorites_history.sqlite3"
+    _write_dashboard_watchlist(watchlist_path)
+
+    payload = build_dashboard_favorites_analysis(
+        watchlist_path=watchlist_path,
+        history_db_path=history_db_path,
+        trades=[],
+    )
+
+    assert payload["data_source"].startswith("dashboard favorites watchlist")
+    assert payload["summary"]["followed_count"] == 1
+    item = payload["items"][0]
+    assert item["symbol"] == "HNTUSD"
+    assert item["display_symbol"] == "HNT/USD"
+    assert item["current_price"] == pytest.approx(0.7365)
+    assert item["ranges"]["24h"]["available"] is True
+    assert item["ranges"]["24h"]["source"] == "kraken_24h_ticker"
+    assert history_db_path.exists()
+
+    detail = build_dashboard_favorite_detail(
+        "HNT/USD",
+        watchlist_path=watchlist_path,
+        history_db_path=history_db_path,
+        trades=[],
+    )
+    assert detail is not None
+    assert detail["symbol"] == "HNTUSD"
+
+
+def test_dashboard_watchlist_handles_missing_config_without_network(tmp_path):
+    payload = build_dashboard_favorites_analysis(
+        watchlist_path=tmp_path / "missing.yaml",
+        history_db_path=tmp_path / "runtime" / "favorites_history.sqlite3",
+        trades=[],
+    )
+
+    assert payload["items"] == []
+    assert payload["summary"]["followed_count"] == 0
+
+
 def test_favorites_routes_render_and_return_safe_json(tmp_path, monkeypatch):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     monkeypatch.setenv("KRAKEN_API_KEY", "favorite-test-api-key")
     monkeypatch.setenv("KRAKEN_API_SECRET", "favorite-test-api-secret")
+    import services.favorites_store as favorites_store
+
+    monkeypatch.setattr(favorites_store, "Kraken", _FavoriteKrakenStub)
     app_mod, db_path = _import_dashboard_app(tmp_path, monkeypatch)
-    _seed_favorite(db_path, now)
+    _write_dashboard_watchlist(tmp_path / "config" / "dashboard_favorites.yaml")
     app_mod._get_trades = lambda limit=500: [
-        {"symbol": "SOLUSDC", "pnl_usdc": 0.1, "reason": "TP", "ts_utc": now.isoformat()},
+        {"symbol": "HNTUSD", "pnl_usdc": 0.1, "reason": "TP", "ts_utc": now.isoformat()},
     ]
     client = app_mod.app.test_client()
     headers = _auth_header()
 
     page = client.get("/favorites", headers=headers)
     overview = client.get("/api/favorites", headers=headers)
-    detail = client.get("/api/favorites/SOLUSDC", headers=headers)
+    detail = client.get("/api/favorites/HNTUSD", headers=headers)
 
     assert page.status_code == 200
     assert b"Favoris" in page.data
+    assert b'x-data="favoriteDashboard"' in page.data
+    assert b"favorites.js?v=20260901b" in page.data
     assert overview.status_code == 200
-    assert overview.get_json()["items"][0]["symbol"] == "SOLUSDC"
+    assert overview.get_json()["items"][0]["symbol"] == "HNTUSD"
     assert detail.status_code == 200
     assert detail.get_json()["item"]["bot_history"]["complete_trades"] == 1
     assert "test-secret-key" not in json.dumps(overview.get_json())

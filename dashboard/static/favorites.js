@@ -13,8 +13,19 @@ function favoriteDashboard() {
     },
 
     async fetchJson(url) {
-      const response = await fetch(url, {credentials: 'same-origin'});
-      const payload = await response.json().catch(() => ({}));
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 12000);
+      let response;
+      let payload;
+      try {
+        response = await fetch(url, {credentials: 'same-origin', signal: controller.signal});
+        payload = await response.json().catch(() => ({}));
+      } catch (error) {
+        if (error?.name === 'AbortError') throw new Error('Délai de chargement dépassé');
+        throw error;
+      } finally {
+        window.clearTimeout(timer);
+      }
       if (!response.ok || payload.ok === false) throw new Error(payload.error || response.statusText || 'no data');
       return payload;
     },
@@ -26,6 +37,7 @@ function favoriteDashboard() {
         const payload = await this.fetchJson('/api/favorites');
         this.items = payload.items || [];
         this.summary = payload.summary || {};
+        this.error = Array.isArray(payload.warnings) && payload.warnings.length ? payload.warnings.join(' · ') : '';
         const next = this.items.find(item => item.symbol === this.selectedSymbol) || this.items[0];
         if (next) await this.select(next.symbol);
         else this.selected = null;
@@ -57,7 +69,10 @@ function favoriteDashboard() {
 
     formatSymbol(symbol) {
       const raw = String(symbol || '').toUpperCase();
-      return raw.endsWith('USDC') ? raw.slice(0, -4) + '/USDC' : raw || '—';
+      for (const quote of ['USDC', 'USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY']) {
+        if (raw.endsWith(quote) && raw.length > quote.length) return raw.slice(0, -quote.length) + '/' + quote;
+      }
+      return raw || '—';
     },
 
     price(value) {
@@ -130,8 +145,8 @@ function favoriteDashboard() {
     riskText(item) { return item?.market?.risk_label || item?.market?.risk_level || 'no data'; },
 
     freshnessText() {
-      if (!this.summary.latest_data_at) return 'Données radar indisponibles';
-      return 'Dernier radar : ' + this.date(this.summary.latest_data_at);
+      if (!this.summary.latest_data_at) return 'Données de favoris indisponibles';
+      return 'Dernière mise à jour : ' + this.date(this.summary.latest_data_at);
     },
 
     freshnessState() {
@@ -187,3 +202,10 @@ function favoriteDashboard() {
     },
   };
 }
+
+function registerFavoriteDashboard() {
+  if (window.Alpine) window.Alpine.data('favoriteDashboard', favoriteDashboard);
+}
+
+document.addEventListener('alpine:init', registerFavoriteDashboard);
+registerFavoriteDashboard();

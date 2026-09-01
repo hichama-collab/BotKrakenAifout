@@ -6,7 +6,7 @@
 {% endblock %}
 
 {% block content %}
-<div x-data="favoriteDashboard()" x-init="init()" class="page-content favorites-page">
+<div x-data="favoriteDashboard" x-init="init()" class="page-content favorites-page">
   <section class="favorites-head" aria-labelledby="favorites-title">
     <div>
       <h1 id="favorites-title">Favoris</h1>
@@ -70,7 +70,7 @@
 
   <section x-show="!loading && items.length === 0" x-cloak class="favorites-empty">
     <strong>no data</strong>
-    <span>Aucun favori actif dans le radar.</span>
+    <span>Aucun favori personnel configuré ou aucune donnée disponible.</span>
   </section>
 
   <div x-show="!loading && items.length" x-cloak class="favorites-layout">
@@ -204,5 +204,5 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/favorites.js?v=20260901a"></script>
+<script src="/static/favorites.js?v=20260901b"></script>
 {% endblock %}

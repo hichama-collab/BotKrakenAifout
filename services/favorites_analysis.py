@@ -18,10 +18,10 @@ try:
 except ImportError:  # Dashboard remains available if an incomplete venv is used.
     yaml = None
 
-from services.token_radar_store import (
-    get_token_snapshot_history,
-    list_favorites,
-    resolve_db_path,
+from services.favorites_store import (
+    get_favorite_snapshot_history,
+    load_dashboard_watchlist,
+    refresh_dashboard_favorites,
 )
 
 
@@ -338,7 +338,12 @@ def _build_item(favorite: Mapping, history: list[dict], trades: Iterable[Mapping
     symbol = _symbol(favorite.get("symbol"))
     item = {
         "symbol": symbol,
+        "display_symbol": str(favorite.get("display_symbol") or symbol),
+        "base_asset": str(favorite.get("base_asset") or ""),
+        "quote_asset": str(favorite.get("quote_asset") or ""),
         "note": str(favorite.get("note") or ""),
+        "data_status": str(favorite.get("data_status") or "ready"),
+        "data_error": str(favorite.get("data_error") or ""),
         "current_price": _number(latest.get("price")) if latest else None,
         "updated_at": latest.get("created_at") if latest else None,
         "freshness": freshness,
@@ -373,6 +378,111 @@ def _build_item(favorite: Mapping, history: list[dict], trades: Iterable[Mapping
             if _number(point.get("price")) is not None
         ]
     return item
+
+
+def _merge_current_snapshot(history: list[dict], current: Mapping | None) -> list[dict]:
+    """Use the fresh ticker result immediately even inside its storage interval."""
+    merged = list(history or [])
+    if not isinstance(current, Mapping) or _number(current.get("price")) is None:
+        return merged
+    current_at = str(current.get("created_at") or "")
+    if merged and str(merged[-1].get("created_at") or "") == current_at:
+        merged[-1] = dict(current)
+    else:
+        merged.append(dict(current))
+    merged.sort(key=lambda item: (_parse_ts(item.get("created_at")) or datetime.min.replace(tzinfo=timezone.utc)))
+    return merged
+
+
+def build_dashboard_favorites_analysis(
+    *,
+    watchlist_path: str | Path,
+    history_db_path: str | Path,
+    risk_yaml_path: str | Path | None = None,
+    trades: Iterable[Mapping] = (),
+    kraken_base_url: str = "https://api.kraken.com",
+    now: datetime | None = None,
+) -> dict:
+    """Build the independent personal watchlist view from public Kraken data.
+
+    This deliberately does not use Token Radar's database or the bot's active
+    symbol. The only write is a compact price history for configured favorites.
+    """
+    current_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    analysis_settings = load_favorites_settings(risk_yaml_path)
+    favorites, watchlist_settings = load_dashboard_watchlist(watchlist_path)
+    trade_rows = list(trades or [])
+    try:
+        records, current_snapshots, warnings = refresh_dashboard_favorites(
+            favorites,
+            db_path=history_db_path,
+            settings=watchlist_settings,
+            base_url=kraken_base_url,
+        )
+    except Exception:
+        records, current_snapshots, warnings = favorites, {}, ["données Kraken indisponibles"]
+
+    items = []
+    for favorite in records:
+        symbol = _symbol(favorite.get("symbol"))
+        try:
+            history = get_favorite_snapshot_history(
+                symbol,
+                db_path=history_db_path,
+                limit=watchlist_settings["history_limit"],
+            )
+        except Exception:
+            history = []
+        item = _build_item(
+            favorite,
+            _merge_current_snapshot(history, current_snapshots.get(symbol)),
+            trade_rows,
+            current_now,
+            analysis_settings,
+        )
+        items.append(item)
+    summary = _summary(items)
+    summary["freshness"] = _freshness(_parse_ts(summary.get("latest_data_at")), current_now, analysis_settings)
+    return {
+        "generated_at": current_now.isoformat(),
+        "data_source": "dashboard favorites watchlist + Kraken public ticker",
+        "summary": summary,
+        "items": items,
+        "warnings": warnings,
+    }
+
+
+def build_dashboard_favorite_detail(
+    symbol: str,
+    *,
+    watchlist_path: str | Path,
+    history_db_path: str | Path,
+    risk_yaml_path: str | Path | None = None,
+    trades: Iterable[Mapping] = (),
+    now: datetime | None = None,
+) -> dict | None:
+    """Return one configured dashboard favorite using only local history."""
+    target = _symbol(symbol)
+    if not target:
+        return None
+    favorites, watchlist_settings = load_dashboard_watchlist(watchlist_path)
+    favorite = next((item for item in favorites if _symbol(item.get("symbol")) == target), None)
+    if favorite is None:
+        return None
+    current_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    history = get_favorite_snapshot_history(
+        target,
+        db_path=history_db_path,
+        limit=watchlist_settings["history_limit"],
+    )
+    return _build_item(
+        favorite,
+        history,
+        list(trades or []),
+        current_now,
+        load_favorites_settings(risk_yaml_path),
+        include_series=True,
+    )
 
 
 def _summary(items: list[dict]) -> dict:
@@ -425,7 +535,12 @@ def build_favorites_analysis(
     trades: Iterable[Mapping] = (),
     now: datetime | None = None,
 ) -> dict:
-    """Build the global read-only favorites view from existing local data."""
+    """Legacy Radar-backed analysis helper kept for its existing callers."""
+    from services.token_radar_store import (
+        get_token_snapshot_history,
+        list_favorites,
+        resolve_db_path,
+    )
     current_now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     settings = load_favorites_settings(risk_yaml_path)
     path = resolve_db_path(db_path=db_path, base_dir=base_dir)
@@ -463,7 +578,12 @@ def build_favorite_detail(
     trades: Iterable[Mapping] = (),
     now: datetime | None = None,
 ) -> dict | None:
-    """Return one active favorite with its compact local price series."""
+    """Legacy Radar-backed detail helper kept for its existing callers."""
+    from services.token_radar_store import (
+        get_token_snapshot_history,
+        list_favorites,
+        resolve_db_path,
+    )
     target = _symbol(symbol)
     if not target:
         return None

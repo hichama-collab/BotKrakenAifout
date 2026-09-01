@@ -75,9 +75,13 @@ python3 tools/token_radar_scan.py
 ```
 
 Radar stores snapshots in `data/token_radar.sqlite3` and the dashboard exposes `/radar`.
-Active radar favorites are also available at `/favorites`. This read-only view
-uses existing radar snapshots and closed bot trades; unavailable time coverage
-is shown as `no data` rather than estimated.
+
+`/favorites` is a separate, read-only personal watchlist. Its pairs live in
+`config/dashboard_favorites.yaml`; it does not read or change the bot's active
+symbol, the Radar universe, strategies, orders, or risk settings. The page uses
+the public Kraken ticker and stores a compact local history only for the listed
+favorites in `data/runtime/favorites_history.sqlite3`. Pairs with no usable
+spot ticker are shown as `no data`; incomplete time windows are never estimated.
 
 ## Tests
 

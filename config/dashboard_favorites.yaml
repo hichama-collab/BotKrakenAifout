@@ -1,0 +1,29 @@
+# Liste personnelle pour /favorites. Elle est indépendante du bot, du radar
+# et de ses paires USDC: aucun élément de ce fichier ne déclenche un ordre.
+settings:
+  snapshot_interval_sec: 60
+  retention_days: 14
+  request_timeout_sec: 4
+  history_limit: 3000
+
+favorites:
+  - HNT/USD
+  - BLESS/USD
+  - BABYSHARK/USD
+  - SYN/USD
+  - APR/USD
+  - GWEI/USD
+  - TRAC/USD
+  - XMN/USD
+  - ES/USD
+  - HFT/USD
+  - LIT/USD
+  - ACA/USD
+  - OXT/USD
+  - PEP/USD
+  - TLM/USD
+  - FIS/USD
+  - CURX/USD
+
+# DEGEN Perp n'est volontairement pas importé: la page suit uniquement des
+# paires spot et ne pilote aucune fonctionnalité de trading.
