@@ -1,4 +1,4 @@
-"""Read-only decision view for the personal dashboard favorites.
+"""Read-only personal watchlist for the dashboard favorites.
 
 This module is deliberately isolated from the bot runtime.  It uses public
 Kraken ticker data plus the compact history of the configured dashboard
@@ -52,16 +52,6 @@ DEFAULT_SETTINGS = {
     "scalping_good_quote_volume_24h": 1000000.0,
     "scalping_clean_reliability_score": 70.0,
     "history_min_trades_for_signal": 3,
-    # Decision-view thresholds.  These are dashboard-only and intentionally
-    # live next to the existing favorites presentation settings in risk.yaml.
-    "watch_min_interest_score": 60.0,
-    "high_priority_interest_score": 75.0,
-    "medium_priority_interest_score": 60.0,
-    "strong_move_pct": 0.12,
-    "too_high_range_position_pct": 85.0,
-    "dead_move_pct": 0.01,
-    "dead_range_pct": 0.012,
-    "high_range_24h_pct": 0.25,
 }
 
 
@@ -389,185 +379,152 @@ def _available_ranges(ranges: Mapping) -> list[dict]:
     return [dict(value) for value in (ranges or {}).values() if isinstance(value, Mapping) and value.get("available")]
 
 
-def _decision_for_item(item: dict, settings: Mapping) -> dict:
-    """Classify one favorite for a human watchlist, not for execution.
+def _observation_profile(history: list[dict], settings: Mapping) -> dict:
+    """Describe what the locally collected data can actually support."""
+    points = []
+    for point in history:
+        created = _parse_ts(point.get("created_at"))
+        price = _number(point.get("price"))
+        if created is not None and price is not None and price > 0:
+            points.append((created, price, _number(point.get("spread_pct")), _number(point.get("quote_volume_24h"))))
+    points.sort(key=lambda row: row[0])
+    if not points:
+        return {"available": False, "days_observed": 0.0, "samples": 0, "verdict": "trop peu de données", "spread_stability": None, "usual_volume_24h": None, "large_moves": 0}
 
-    The calculations stay intentionally small and visible in ``reasons`` so
-    that a user can disagree with a classification without needing to reverse
-    engineer a model.
-    """
-    latest_ok = item.get("current_price") is not None
-    fresh = bool((item.get("freshness") or {}).get("is_fresh"))
-    market = item.get("market") or {}
-    day = (item.get("ranges") or {}).get("24h") or {}
-    spread = _number(market.get("spread_pct"))
-    volume = _number(market.get("quote_volume_24h"))
-    range_position = _number(day.get("position_in_range_pct")) if day.get("available") else None
-    day_range = _number(day.get("range_pct")) if day.get("available") else None
+    span_sec = max(0.0, (points[-1][0] - points[0][0]).total_seconds())
+    moves = []
+    for previous, current in zip(points, points[1:]):
+        movement = (current[1] - previous[1]) / previous[1]
+        if abs(movement) >= float(settings["calm_change_pct"]):
+            moves.append(movement)
+    large_moves = sum(abs(value) >= float(settings["high_volatility_pct"]) for value in moves)
+    signs = [1 if value > 0 else -1 for value in moves]
+    changes_of_direction = sum(current != previous for previous, current in zip(signs, signs[1:]))
+    spread_values = [row[2] for row in points if row[2] is not None]
+    volume_values = [row[3] for row in points if row[3] is not None]
+    spread_stability = None
+    if len(spread_values) >= 3:
+        average_spread = sum(spread_values) / len(spread_values)
+        spread_stability = "stable" if average_spread == 0 or (max(spread_values) - min(spread_values)) / average_spread <= 0.5 else "variable"
+
+    enough_history = len(points) >= 3 and span_sec >= 3600
+    if not enough_history:
+        verdict = "trop peu de données"
+    elif large_moves:
+        verdict = "actif mais volatile"
+    elif len(signs) >= 4 and changes_of_direction / max(1, len(signs) - 1) >= 0.65:
+        verdict = "irrégulier"
+    else:
+        verdict = "fiable à observer"
+    return {
+        "available": enough_history,
+        "days_observed": round(span_sec / 86400, 2),
+        "samples": len(points),
+        "verdict": verdict,
+        "spread_stability": spread_stability,
+        "usual_volume_24h": round(sum(volume_values) / len(volume_values), 8) if volume_values else None,
+        "large_moves": large_moves,
+        "direction_changes": changes_of_direction,
+    }
+
+
+def _range_reading(day_range: Mapping | None, settings: Mapping) -> str:
+    if not isinstance(day_range, Mapping) or not day_range.get("available"):
+        return "range 24 h indisponible"
+    position = _number(day_range.get("position_in_range_pct"))
+    width = _number(day_range.get("range_pct"))
+    if position is not None and position >= 80:
+        position_text = "proche du plus haut récent"
+    elif position is not None and position <= 20:
+        position_text = "proche du plus bas récent"
+    else:
+        position_text = "au milieu du range"
+    if width is not None and width <= float(settings["tight_range_pct"]):
+        return f"{position_text}, range serré"
+    if width is not None and width >= float(settings["high_volatility_pct"]):
+        return f"{position_text}, range large"
+    return position_text
+
+
+def _watchlist_reading(item: Mapping, settings: Mapping) -> dict:
+    """Turn available metrics into a neutral, human tracking note."""
+    if item.get("current_price") is None:
+        return {
+            "behavior": "données insuffisantes",
+            "summary": "Paire indisponible ou données publiques absentes.",
+            "range_reading": "historique insuffisant",
+            "trend": "unknown",
+        }
     changes = item.get("changes") or {}
     change_24h = _number(changes.get("change_24h_pct"))
-    short_change = next(
-        (
-            _number(changes.get(key))
-            for key in ("change_5m_pct", "change_15m_pct", "change_1h_pct")
-            if _number(changes.get(key)) is not None
-        ),
-        None,
-    )
-    clean_spread = float(settings["scalping_clean_max_spread_pct"])
-    max_spread = float(settings["scalping_acceptable_max_spread_pct"])
-    low_volume = float(settings["scalping_low_quote_volume_24h"])
-    good_volume = float(settings["scalping_good_quote_volume_24h"])
-    high_range_position = float(settings["too_high_range_position_pct"])
-    high_range_24h = float(settings["high_range_24h_pct"])
-    strong_move = float(settings["strong_move_pct"])
-
-    if not latest_ok or spread is None or volume is None:
-        cause = item.get("data_error") or "prix, spread ou volume indisponible"
-        return {
-            "group": "insufficient",
-            "verdict": "Données insuffisantes",
-            "priority": None,
-            "interest_score": 0,
-            "summary": "Analyse en attente de données de marché fiables.",
-            "reasons": [cause],
-            "range_position_pct": range_position,
-            "history_note": "Historique insuffisant" if not _available_ranges(item.get("ranges")) else None,
-        }
-
-    score = 45.0
-    reasons: list[str] = []
-    if fresh:
-        score += 10
-        reasons.append("données fraîches")
+    observation = item.get("observation") or {}
+    day = (item.get("ranges") or {}).get("24h")
+    if change_24h is not None and change_24h >= float(settings["high_volatility_pct"]):
+        behavior = "forte poussée récente"
+        trend = "up"
+    elif change_24h is not None and change_24h > float(settings["calm_change_pct"]):
+        behavior = "progression régulière"
+        trend = "up"
+    elif change_24h is not None and change_24h <= -float(settings["high_volatility_pct"]):
+        behavior = "baisse marquée"
+        trend = "down"
+    elif change_24h is not None and change_24h < -float(settings["calm_change_pct"]):
+        behavior = "baisse contrôlée"
+        trend = "down"
+    elif observation.get("verdict") == "actif mais volatile":
+        behavior = "mouvement instable"
+        trend = "mixed"
+    elif isinstance(day, Mapping) and _number(day.get("range_pct")) is not None and float(day["range_pct"]) <= float(settings["tight_range_pct"]):
+        behavior = "range serré"
+        trend = "stable"
     else:
-        score -= 20
-        reasons.append("données anciennes")
-    if volume >= good_volume:
-        score += 15
-        reasons.append("volume correct")
-    elif volume >= low_volume:
-        score += 6
-        reasons.append("volume présent")
-    else:
-        score -= 24
-        reasons.append("volume faible")
-    if spread <= clean_spread:
-        score += 15
-        reasons.append("spread propre")
-    elif spread <= max_spread:
-        score += 6
-        reasons.append("spread acceptable")
-    else:
-        score -= 26
-        reasons.append("spread large")
-    if range_position is None:
-        reasons.append("range 24 h indisponible")
-    elif range_position >= high_range_position:
-        score -= 22
-        reasons.append("proche du haut 24 h")
-    elif range_position <= 70:
-        score += 10
-        reasons.append("pas encore trop haut")
-    else:
-        score += 3
-    if day_range is not None and day_range >= high_range_24h:
-        score -= 15
-        reasons.append("amplitude élevée")
-    if change_24h is not None:
-        if 0 < change_24h < strong_move:
-            score += 10
-            reasons.append("mouvement positif mesuré")
-        elif change_24h >= strong_move:
-            score -= 12
-            reasons.append("mouvement déjà avancé")
-        elif abs(change_24h) <= float(settings["dead_move_pct"]):
-            score -= 8
-            reasons.append("peu de mouvement")
-    score = max(0, min(100, int(round(score))))
-
-    # The order is deliberate: a market quality problem is more useful to
-    # surface than a flattering score, and each token lands in one group only.
-    if not fresh:
-        group, verdict, summary = "insufficient", "Données insuffisantes", "Données trop anciennes pour une lecture actuelle."
-    elif volume < low_volume:
-        group, verdict, summary = "low_volume", "Volume faible", "Volume trop limité pour une lecture utile aujourd’hui."
-    elif spread > max_spread:
-        group, verdict, summary = "dirty_spread", "Sale", "Spread trop large pour une observation propre."
-    elif range_position is not None and range_position >= high_range_position:
-        group, verdict, summary = "chase", "Trop tard", "Mouvement déjà avancé, proche du haut de range 24 h."
-    elif day_range is not None and day_range >= high_range_24h:
-        group, verdict, summary = "volatile", "Trop volatil", "Amplitude importante : le mouvement manque de stabilité."
-    elif (
-        (change_24h is not None and abs(change_24h) <= float(settings["dead_move_pct"]))
-        or (day_range is not None and day_range <= float(settings["dead_range_pct"]))
-    ):
-        group, verdict, summary = "dead", "Calme", "Peu de mouvement exploitable aujourd’hui."
-    elif score >= float(settings["watch_min_interest_score"]):
-        group, verdict, summary = "watch_now", "À surveiller", "Mouvement lisible, conditions de marché correctes, sans excès visible."
-    else:
-        group, verdict, summary = "clean", "Propre", "Conditions lisibles : à garder en observation."
-
-    priority = None
-    if group == "watch_now":
-        if score >= float(settings["high_priority_interest_score"]):
-            priority = "HIGH"
-        elif score >= float(settings["medium_priority_interest_score"]):
-            priority = "MEDIUM"
-        else:
-            priority = "LOW"
-    acceleration = short_change
-    return {
-        "group": group,
-        "verdict": verdict,
-        "priority": priority,
-        "interest_score": score,
-        "summary": summary,
-        "reasons": reasons[:4],
-        "range_position_pct": range_position,
-        "acceleration_pct": _pct(acceleration),
-        "history_note": "Historique insuffisant" if len(_available_ranges(item.get("ranges"))) <= 1 else None,
-    }
+        behavior = "évolution à documenter"
+        trend = "stable" if change_24h is not None else "unknown"
+    range_reading = _range_reading(day, settings)
+    summary = f"{behavior.capitalize()} ; {range_reading}."
+    return {"behavior": behavior, "summary": summary, "range_reading": range_reading, "trend": trend}
 
 
-DECISION_GROUPS = (
-    ("watch_now", "À surveiller maintenant", "Favoris qui méritent une attention immédiate."),
-    ("clean", "Mouvement propre", "Conditions lisibles à garder sous observation."),
-    ("chase", "Trop tard / risque de chase", "Mouvements déjà proches de leur haut récent."),
-    ("volatile", "Trop volatil", "Amplitude trop élevée pour une lecture sereine."),
-    ("dead", "Favoris morts aujourd’hui", "Peu de mouvement exploitable pour le moment."),
-    ("low_volume", "Volume faible", "Liquidité trop limitée pour une lecture fiable."),
-    ("dirty_spread", "Spread sale", "Écart achat/vente trop large pour une observation propre."),
-    ("insufficient", "Données insuffisantes", "Les données disponibles ne permettent pas une lecture utile."),
-)
-
-
-def _decorate_dashboard_decisions(items: list[dict], settings: Mapping) -> tuple[list[dict], dict, list[dict]]:
-    groups = {key: {"key": key, "title": title, "description": description, "items": []} for key, title, description in DECISION_GROUPS}
+def _decorate_dashboard_watchlist(items: list[dict], settings: Mapping) -> tuple[list[dict], dict, list[dict]]:
+    """Prepare overview counts and neutral highlights without rejecting tokens."""
+    available, missing = [], []
     for item in items:
-        decision = _decision_for_item(item, settings)
-        item["decision"] = decision
-        item["verdict"] = decision["verdict"]
         item["available_ranges"] = _available_ranges(item.get("ranges"))
-        groups[decision["group"]]["items"].append(item)
+        item["watchlist"] = _watchlist_reading(item, settings)
+        if item.get("current_price") is None:
+            missing.append(item)
+        else:
+            available.append(item)
+    available.sort(key=lambda item: item.get("display_symbol") or "")
+    missing.sort(key=lambda item: item.get("display_symbol") or "")
+    all_items = available + missing
 
-    for group in groups.values():
-        group["items"].sort(key=lambda item: (-int((item.get("decision") or {}).get("interest_score") or 0), item.get("display_symbol") or ""))
-
-    watch = groups["watch_now"]["items"]
-    clean = groups["clean"]["items"]
-    candidates = [item for item in items if (item.get("decision") or {}).get("group") not in {"insufficient", "low_volume", "dirty_spread"}]
-    accelerated = [item for item in candidates if _number((item.get("decision") or {}).get("acceleration_pct")) is not None]
-    summary_cards = {
-        "best_to_watch": watch[0] if watch else (clean[0] if clean else None),
-        "cleanest_move": (clean + watch)[0] if (clean + watch) else None,
-        "strongest_acceleration": max(accelerated, key=lambda item: _number(item["decision"]["acceleration_pct"]) or -float("inf"), default=None),
-        "chase_risk": groups["chase"]["items"][0] if groups["chase"]["items"] else None,
-        "insufficient_count": len(groups["insufficient"]["items"]),
+    changes = [(item, _number((item.get("changes") or {}).get("change_24h_pct"))) for item in available]
+    rising = [item for item, change in changes if change is not None and change > float(settings["calm_change_pct"])]
+    falling = [item for item, change in changes if change is not None and change < -float(settings["calm_change_pct"])]
+    stable = [item for item, change in changes if change is not None and abs(change) <= float(settings["calm_change_pct"])]
+    volatile = [item for item in available if (item.get("observation") or {}).get("verdict") == "actif mais volatile"]
+    positions = [(item, _number(((item.get("ranges") or {}).get("24h") or {}).get("position_in_range_pct"))) for item in available]
+    observed = [item for item in available if (item.get("observation") or {}).get("available")]
+    bot_history = [item for item in available if (item.get("bot_history") or {}).get("available")]
+    most_active = max(changes, key=lambda row: abs(row[1]) if row[1] is not None else -1, default=(None, None))[0]
+    highlights = {
+        "most_active": most_active,
+        "most_regular": max(observed, key=lambda item: (item.get("observation") or {}).get("days_observed") or 0, default=None),
+        "strongest_variation": max(changes, key=lambda row: abs(row[1]) if row[1] is not None else -1, default=(None, None))[0],
+        "near_low": min((row for row in positions if row[1] is not None), key=lambda row: row[1], default=(None, None))[0],
+        "near_high": max((row for row in positions if row[1] is not None), key=lambda row: row[1], default=(None, None))[0],
+        "best_bot_history": max(bot_history, key=lambda item: _number((item.get("bot_history") or {}).get("net_pnl_usdc")) or -float("inf"), default=None),
     }
-    ordered_groups = [groups[key] for key, _title, _description in DECISION_GROUPS]
-    sorted_items = [item for group in ordered_groups for item in group["items"]]
-    return sorted_items, summary_cards, ordered_groups
+    return all_items, {
+        "followed_count": len(items),
+        "rising_count": len(rising),
+        "falling_count": len(falling),
+        "stable_count": len(stable),
+        "volatile_count": len(volatile),
+        "insufficient_count": len(missing),
+        "highlights": highlights,
+    }, missing
 
 
 def _build_item(favorite: Mapping, history: list[dict], trades: Iterable[Mapping], now: datetime, settings: Mapping, include_series: bool = False) -> dict:
@@ -576,6 +533,18 @@ def _build_item(favorite: Mapping, history: list[dict], trades: Iterable[Mapping
     ranges = _ranges(history, latest, now, settings)
     freshness = _freshness(latest_at, now, settings)
     changes = _effective_changes(history, latest, now)
+    range_change_keys = {
+        "5m": "change_5m_pct",
+        "15m": "change_15m_pct",
+        "1h": "change_1h_pct",
+        "4h": "change_4h_pct",
+        "24h": "change_24h_pct",
+        "7d": "change_7d_pct",
+    }
+    for label, range_data in ranges.items():
+        if isinstance(range_data, dict):
+            range_data["change_pct"] = changes.get(range_change_keys.get(label, ""))
+    observation = _observation_profile(history, settings)
     behavior_latest = dict(latest or {})
     behavior_latest.update({key: value for key, value in changes.items() if value is not None})
     behavior = _behavior(behavior_latest if latest else None, ranges, settings)
@@ -609,6 +578,7 @@ def _build_item(favorite: Mapping, history: list[dict], trades: Iterable[Mapping
             "movement_risk_score": _number((latest or {}).get("movement_risk_score", (latest or {}).get("noise_score"))),
         },
         "ranges": ranges,
+        "observation": observation,
         "behavior": behavior,
         "scalping_quality": scalping,
         "bot_history": _personal_history(symbol, trades, settings),
@@ -684,16 +654,16 @@ def build_dashboard_favorites_analysis(
             analysis_settings,
         )
         items.append(item)
-    items, summary_cards, groups = _decorate_dashboard_decisions(items, analysis_settings)
+    items, overview, missing_items = _decorate_dashboard_watchlist(items, analysis_settings)
     summary = _summary(items)
     summary["freshness"] = _freshness(_parse_ts(summary.get("latest_data_at")), current_now, analysis_settings)
-    summary["decision_cards"] = summary_cards
     return {
         "generated_at": current_now.isoformat(),
         "data_source": "dashboard favorites watchlist + Kraken public ticker",
         "summary": summary,
+        "overview": overview,
         "items": items,
-        "groups": groups,
+        "missing_items": missing_items,
         "warnings": warnings,
     }
 
@@ -721,15 +691,16 @@ def build_dashboard_favorite_detail(
         db_path=history_db_path,
         limit=watchlist_settings["history_limit"],
     )
+    settings = load_favorites_settings(risk_yaml_path)
     item = _build_item(
         favorite,
         history,
         list(trades or []),
         current_now,
-        load_favorites_settings(risk_yaml_path),
+        settings,
         include_series=True,
     )
-    _decorate_dashboard_decisions([item], load_favorites_settings(risk_yaml_path))
+    _decorate_dashboard_watchlist([item], settings)
     return item
 
 

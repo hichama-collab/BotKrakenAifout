@@ -298,10 +298,10 @@ def test_favorites_routes_render_and_return_safe_json(tmp_path, monkeypatch):
     detail = client.get("/api/favorites/HNTUSD", headers=headers)
 
     assert page.status_code == 200
-    assert b"Favoris" in page.data
+    assert b"Mes favoris" in page.data
     assert b"HNT/USD" in page.data
-    assert b"Quoi surveiller maintenant" in page.data
-    assert b"favorite-decision-card" in page.data
+    assert b"Mes favoris aujourd" in page.data
+    assert b"favorite-card" in page.data
     assert b"favorites-loading" not in page.data
     assert overview.status_code == 200
     assert overview.get_json()["items"][0]["symbol"] == "HNTUSD"
@@ -312,7 +312,7 @@ def test_favorites_routes_render_and_return_safe_json(tmp_path, monkeypatch):
     assert "favorite-test-api-secret" not in json.dumps(detail.get_json())
 
 
-def test_dashboard_favorites_classifies_human_groups_without_historical_snapshots(tmp_path, monkeypatch):
+def test_dashboard_favorites_keeps_all_tokens_in_watchlist_with_partial_data(tmp_path, monkeypatch):
     now = datetime.now(timezone.utc).replace(microsecond=0)
     watchlist_path = tmp_path / "config" / "dashboard_favorites.yaml"
     _write_dashboard_watchlist(watchlist_path)
@@ -337,19 +337,19 @@ def test_dashboard_favorites_classifies_human_groups_without_historical_snapshot
         history_db_path=tmp_path / "runtime" / "favorites.sqlite3",
         now=now,
     )
-    groups = {group["key"]: {item["symbol"] for item in group["items"]} for group in payload["groups"]}
+    items = {item["symbol"]: item for item in payload["items"]}
 
-    assert "WATCHUSD" in groups["watch_now"]
-    assert "CHASEUSD" in groups["chase"]
-    assert "VOLUSD" in groups["volatile"]
-    assert "DEADUSD" in groups["dead"]
-    assert "LOWUSD" in groups["low_volume"]
-    assert "SPREADUSD" in groups["dirty_spread"]
-    assert "MISSUSD" in groups["insufficient"]
-    assert payload["summary"]["decision_cards"]["best_to_watch"]["symbol"] == "WATCHUSD"
+    assert set(items) == {"WATCHUSD", "CHASEUSD", "VOLUSD", "DEADUSD", "LOWUSD", "SPREADUSD", "MISSUSD"}
+    assert payload["overview"]["followed_count"] == 7
+    assert payload["overview"]["insufficient_count"] == 1
+    assert payload["missing_items"][0]["symbol"] == "MISSUSD"
+    assert items["WATCHUSD"]["ranges"]["24h"]["available"] is True
+    assert items["WATCHUSD"]["watchlist"]["behavior"]
+    assert items["LOWUSD"]["current_price"] == 50.0
+    assert items["SPREADUSD"]["current_price"] == 50.0
 
 
-def test_dashboard_favorites_groups_public_api_failure_as_insufficient_data(tmp_path, monkeypatch):
+def test_dashboard_favorites_groups_public_api_failure_as_compact_missing_data(tmp_path, monkeypatch):
     watchlist_path = tmp_path / "config" / "dashboard_favorites.yaml"
     _write_dashboard_watchlist(watchlist_path)
 
@@ -363,8 +363,35 @@ def test_dashboard_favorites_groups_public_api_failure_as_insufficient_data(tmp_
     )
 
     assert payload["warnings"] == ["données Kraken indisponibles"]
-    assert payload["groups"][-1]["key"] == "insufficient"
-    assert len(payload["groups"][-1]["items"]) == 1
+    assert len(payload["missing_items"]) == 1
+    assert payload["missing_items"][0]["symbol"] == "HNTUSD"
+
+
+def test_dashboard_favorites_builds_time_journey_and_observation_when_snapshots_exist(tmp_path, monkeypatch):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    watchlist_path = tmp_path / "config" / "dashboard_favorites.yaml"
+    _write_dashboard_watchlist(watchlist_path)
+    record = _dashboard_record("HNTUSD")
+    current = _dashboard_snapshot("HNTUSD", now, price=51, low=48, high=52)
+    history = [
+        _dashboard_snapshot("HNTUSD", now - timedelta(hours=2), price=49, low=48, high=52),
+        _dashboard_snapshot("HNTUSD", now - timedelta(hours=1), price=50, low=48, high=52),
+        current,
+    ]
+    monkeypatch.setattr(favorites_analysis, "refresh_dashboard_favorites", lambda *_args, **_kwargs: ([record], {"HNTUSD": current}, []))
+    monkeypatch.setattr(favorites_analysis, "get_favorite_snapshot_history", lambda *_args, **_kwargs: history)
+
+    item = build_dashboard_favorites_analysis(
+        watchlist_path=watchlist_path,
+        history_db_path=tmp_path / "runtime" / "favorites.sqlite3",
+        now=now,
+    )["items"][0]
+
+    assert item["ranges"]["1h"]["available"] is True
+    assert item["ranges"]["1h"]["min"] == 50.0
+    assert item["ranges"]["1h"]["max"] == 51.0
+    assert item["observation"]["samples"] == 3
+    assert item["observation"]["verdict"] == "fiable à observer"
 
 
 def test_favorites_routes_do_not_crash_without_favorites_or_trades(tmp_path, monkeypatch):
