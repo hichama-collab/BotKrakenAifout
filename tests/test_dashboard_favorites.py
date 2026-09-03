@@ -15,6 +15,7 @@ from services.favorites_analysis import (
     build_favorites_analysis,
 )
 import services.favorites_analysis as favorites_analysis
+import services.favorites_series as favorites_series
 from services.token_radar_store import add_favorite, insert_snapshots
 
 
@@ -50,15 +51,32 @@ class _FavoriteKrakenStub:
                     "h": ["0.75", "0.88"],
                 }
             }
+        if path == "/0/public/OHLC":
+            return {
+                "HNTUSD": [
+                    [1_700_000_000, "0.700", "0.720", "0.690", "0.710", "0.705", "100"],
+                    [1_700_000_300, "0.710", "0.740", "0.705", "0.736", "0.720", "120"],
+                ],
+                "last": 1_700_000_300,
+            }
         raise AssertionError(f"Unexpected public endpoint: {path}")
+
+    def klines(self, symbol, interval="1m", limit=50):
+        assert symbol == "HNTUSD"
+        return [
+            [1_700_000_000_000, "0.700", "0.720", "0.690", "0.710", "100"],
+            [1_700_000_300_000, "0.710", "0.740", "0.705", "0.736", "120"],
+        ][-limit:]
 
 
 @pytest.fixture(autouse=True)
 def _reset_dashboard_module():
     """Keep environment-specific Flask imports isolated from sibling tests."""
     sys.modules.pop("dashboard.app", None)
+    favorites_series.clear_favorite_series_cache()
     yield
     sys.modules.pop("dashboard.app", None)
+    favorites_series.clear_favorite_series_cache()
 
 
 def _auth_header(user="admin", password="test-password"):
@@ -237,6 +255,7 @@ def test_dashboard_watchlist_is_independent_from_radar_and_uses_public_ticker(tm
     import services.favorites_store as favorites_store
 
     monkeypatch.setattr(favorites_store, "Kraken", _FavoriteKrakenStub)
+    monkeypatch.setattr(favorites_series, "Kraken", _FavoriteKrakenStub)
     watchlist_path = tmp_path / "config" / "dashboard_favorites.yaml"
     history_db_path = tmp_path / "runtime" / "favorites_history.sqlite3"
     _write_dashboard_watchlist(watchlist_path)
@@ -285,6 +304,7 @@ def test_favorites_routes_render_and_return_safe_json(tmp_path, monkeypatch):
     import services.favorites_store as favorites_store
 
     monkeypatch.setattr(favorites_store, "Kraken", _FavoriteKrakenStub)
+    monkeypatch.setattr(favorites_series, "Kraken", _FavoriteKrakenStub)
     app_mod, db_path = _import_dashboard_app(tmp_path, monkeypatch)
     _write_dashboard_watchlist(tmp_path / "config" / "dashboard_favorites.yaml")
     app_mod._get_trades = lambda limit=500: [
@@ -300,13 +320,18 @@ def test_favorites_routes_render_and_return_safe_json(tmp_path, monkeypatch):
     assert page.status_code == 200
     assert b"Mes favoris" in page.data
     assert b"HNT/USD" in page.data
-    assert b"Mes favoris aujourd" in page.data
-    assert b"favorite-card" in page.data
+    assert b"Favori s\xc3\xa9lectionn\xc3\xa9" in page.data
+    assert b"favorites-sidebar" in page.data
+    assert b"favorite-chart" in page.data
     assert b"favorites-loading" not in page.data
     assert overview.status_code == 200
     assert overview.get_json()["items"][0]["symbol"] == "HNTUSD"
     assert detail.status_code == 200
     assert detail.get_json()["item"]["bot_history"]["complete_trades"] == 1
+    series = client.get("/api/favorites/HNTUSD/series?period=1h", headers=headers)
+    assert series.status_code == 200
+    assert series.get_json()["series"]["source"] == "kraken_ohlc"
+    assert len(series.get_json()["series"]["bars"]) == 2
     assert "test-secret-key" not in json.dumps(overview.get_json())
     assert b"favorite-test-api-key" not in page.data
     assert "favorite-test-api-secret" not in json.dumps(detail.get_json())
@@ -392,6 +417,35 @@ def test_dashboard_favorites_builds_time_journey_and_observation_when_snapshots_
     assert item["ranges"]["1h"]["max"] == 51.0
     assert item["observation"]["samples"] == 3
     assert item["observation"]["verdict"] == "fiable à observer"
+
+
+def test_favorite_series_falls_back_to_local_snapshots_without_kraken(tmp_path, monkeypatch):
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    class _UnavailableKraken:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def klines(self, *args, **kwargs):
+            raise RuntimeError("public endpoint unavailable")
+
+    snapshots = [
+        {"created_at": (now - timedelta(minutes=4)).isoformat(), "price": 0.70},
+        {"created_at": now.isoformat(), "price": 0.73},
+    ]
+    monkeypatch.setattr(favorites_series, "Kraken", _UnavailableKraken)
+    monkeypatch.setattr(favorites_series, "get_favorite_snapshot_history", lambda *_args, **_kwargs: snapshots)
+
+    series = favorites_series.get_favorite_series(
+        "HNTUSD",
+        period="5m",
+        history_db_path=tmp_path / "favorites.sqlite3",
+        now=now,
+    )
+
+    assert series["source"] == "local_snapshots"
+    assert series["min"] == pytest.approx(0.70)
+    assert series["max"] == pytest.approx(0.73)
 
 
 def test_favorites_routes_do_not_crash_without_favorites_or_trades(tmp_path, monkeypatch):

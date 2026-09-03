@@ -2,7 +2,7 @@
 {% block title %}Favoris{% endblock %}
 
 {% block head_extra %}
-<link rel="stylesheet" href="/static/favorites.css?v=20260903b" />
+<link rel="stylesheet" href="/static/favorites.css?v=20260903c" />
 {% endblock %}
 
 {% macro price(value) -%}
@@ -14,7 +14,7 @@
 {%- endmacro %}
 
 {% macro pct(value) -%}
-  {%- if value is none -%}historique insuffisant
+  {%- if value is none -%}—
   {%- else -%}{{ '%+.2f%%'|format(value * 100) }}
   {%- endif -%}
 {%- endmacro %}
@@ -27,159 +27,127 @@
   {%- endif -%}
 {%- endmacro %}
 
-{% macro favorite_card(item) -%}
+{% macro range_state(day) -%}
+  {%- if not day or not day.available -%}historique en cours de collecte
+  {%- elif day.position_in_range_pct >= 80 -%}proche du haut récent
+  {%- elif day.position_in_range_pct <= 20 -%}proche du bas récent
+  {%- else -%}au milieu du range
+  {%- endif -%}
+{%- endmacro %}
+
+{% macro selected_detail(item) -%}
   {% set day = item.ranges.get('24h') %}
-  <article class="favorite-card">
-    <header class="favorite-card-head">
+  <section class="selected-detail" id="favorite-detail" data-symbol="{{ item.symbol }}">
+    <header class="selected-head">
       <div>
-        <h3>{{ item.display_symbol }}</h3>
-        <p>{{ item.watchlist.behavior }}</p>
+        <p class="section-kicker">Favori sélectionné</p>
+        <h1 data-field="symbol">{{ item.display_symbol }}</h1>
+        <p class="selected-reading" data-field="reading">{{ item.watchlist.summary }}</p>
       </div>
-      <strong class="favorite-price num">{{ price(item.current_price) }} <small>{{ item.quote_asset }}</small></strong>
+      <a class="kraken-link" data-field="kraken-link" href="https://pro.kraken.com/app/trade/{{ item.display_symbol|replace('/', '-')|lower }}" target="_blank" rel="noreferrer">Ouvrir Kraken Pro</a>
     </header>
 
-    <p class="favorite-reading">{{ item.watchlist.summary }}</p>
-    <dl class="favorite-facts">
-      <div><dt>24 h</dt><dd>{{ pct(item.changes.change_24h_pct) }}</dd></div>
-      <div><dt>Min / max 24 h</dt><dd>{% if day and day.available %}{{ price(day.min) }} → {{ price(day.max) }}{% else %}historique insuffisant{% endif %}</dd></div>
-      <div><dt>Position</dt><dd>{% if day and day.available %}{{ '%.0f%%'|format(day.position_in_range_pct) }} du range{% else %}—{% endif %}</dd></div>
-      {% if item.market.quote_volume_24h is not none %}<div><dt>Volume 24 h</dt><dd>{{ compact(item.market.quote_volume_24h) }} {{ item.quote_asset }}</dd></div>{% endif %}
-    </dl>
-  </article>
-{%- endmacro %}
+    <section class="price-band" aria-label="Prix actuel">
+      <div><span>Prix actuel</span><strong class="num" data-field="price">{{ price(item.current_price) }} <small>{{ item.quote_asset }}</small></strong></div>
+      <div><span>Variation 24 h</span><strong class="num" data-field="change-24h">{{ pct(item.changes.change_24h_pct) }}</strong></div>
+      <div><span>Volume 24 h</span><strong data-field="volume">{{ compact(item.market.quote_volume_24h) }} {{ item.quote_asset }}</strong></div>
+      <div><span>Comportement</span><strong data-field="behavior">{{ item.watchlist.behavior }}</strong></div>
+    </section>
 
-{% macro journey(item) -%}
-  <details class="favorite-journey" id="journey-{{ item.symbol }}">
-    <summary>
-      <span><strong>{{ item.display_symbol }}</strong><em>{{ item.watchlist.summary }}</em></span>
-      <span class="journey-summary-price num">{{ price(item.current_price) }} {{ item.quote_asset }}</span>
-    </summary>
-    <div class="journey-content">
-      {% if item.available_ranges %}
-        <section>
-          <h3>Parcours observé</h3>
-          <div class="range-grid">
-            {% for range in item.available_ranges %}
-              <article class="range-item">
-                <strong>{{ range.period }}</strong>
-                <span>{{ price(range.min) }} → {{ price(range.max) }}</span>
-                <span>{{ pct(range.change_pct) }}</span>
-                <em>{{ '%.0f%%'|format(range.position_in_range_pct) }} du range</em>
-              </article>
-            {% endfor %}
-          </div>
-          {% if item.available_ranges|length == 1 %}<p class="history-note">Historique local encore court : le range Kraken 24 h est disponible dès maintenant.</p>{% endif %}
-        </section>
-      {% else %}
-        <p class="history-note">Historique insuffisant pour tracer le parcours de cette paire.</p>
-      {% endif %}
-
-      <section class="observation-panel">
-        <div>
-          <h3>Fiabilité observable</h3>
-          <p>{{ item.observation.verdict }}</p>
-          <dl>
-            <div><dt>Jours observés</dt><dd>{{ item.observation.days_observed }}</dd></div>
-            <div><dt>Relevés</dt><dd>{{ item.observation.samples }}</dd></div>
-            {% if item.observation.spread_stability %}<div><dt>Spread</dt><dd>{{ item.observation.spread_stability }}</dd></div>{% endif %}
-            {% if item.observation.usual_volume_24h is not none %}<div><dt>Volume habituel</dt><dd>{{ compact(item.observation.usual_volume_24h) }} {{ item.quote_asset }}</dd></div>{% endif %}
-            {% if item.observation.large_moves %}<div><dt>Gros écarts</dt><dd>{{ item.observation.large_moves }}</dd></div>{% endif %}
-          </dl>
+    <section class="chart-panel" aria-labelledby="chart-title">
+      <header class="chart-head">
+        <div><h2 id="chart-title">Parcours du prix</h2><p data-field="chart-caption">{{ initial_series.source if initial_series else 'historique en cours de collecte' }}</p></div>
+        <div class="period-tabs" role="tablist" aria-label="Période du graphique">
+          {% for period in ('5m', '15m', '1h', '4h', '24h', '7d') %}<button type="button" class="period-tab {% if period == '24h' %}is-active{% endif %}" data-period="{{ period }}">{{ period }}</button>{% endfor %}
         </div>
-        <div>
-          <h3>Historique personnel du bot</h3>
-          {% if item.bot_history.available %}
-            <p>{{ item.bot_history.assessment }}</p>
-            <dl>
-              <div><dt>Trades</dt><dd>{{ item.bot_history.complete_trades }}</dd></div>
-              <div><dt>PnL net</dt><dd class="num">{{ '%.4f'|format(item.bot_history.net_pnl_usdc) }} USDC</dd></div>
-              <div><dt>Meilleur</dt><dd class="num">{{ '%.4f'|format(item.bot_history.best_trade_usdc) }} USDC</dd></div>
-              <div><dt>Pire</dt><dd class="num">{{ '%.4f'|format(item.bot_history.worst_trade_usdc) }} USDC</dd></div>
-              <div><dt>Dernière activité</dt><dd>{{ item.bot_history.last_activity or '—' }}</dd></div>
-              {% if item.bot_history.frequent_exits %}<div><dt>Sortie fréquente</dt><dd>{{ item.bot_history.frequent_exits[0].reason }}</dd></div>{% endif %}
-            </dl>
-          {% else %}
-            <p>aucun historique bot</p>
-          {% endif %}
-        </div>
-      </section>
-    </div>
-  </details>
-{%- endmacro %}
+      </header>
+      <div class="price-chart" id="favorite-chart" aria-label="Graphique du prix sélectionné"></div>
+      <p class="chart-empty" id="chart-empty" hidden>Historique indisponible pour cette période.</p>
+    </section>
 
-{% macro highlight(label, item, text) -%}
-  <article class="watchlist-highlight">
-    <span>{{ label }}</span>
-    {% if item %}
-      <strong>{{ item.display_symbol }}</strong>
-      <p>{{ text }}</p>
-    {% else %}
-      <strong>À documenter</strong>
-      <p>L’historique local se complète au fil des relevés.</p>
-    {% endif %}
-  </article>
+    <section class="range-panel" aria-labelledby="range-title">
+      <header><h2 id="range-title" data-field="range-title">Range 24 h</h2><p data-field="range-reading">{{ range_state(day) }}</p></header>
+      <div class="range-values">
+        <div><span>Min</span><strong class="num" data-field="range-min">{{ price(day.min) if day and day.available else '—' }}</strong></div>
+        <div><span>Actuel</span><strong class="num" data-field="range-current">{{ price(item.current_price) }}</strong></div>
+        <div><span>Max</span><strong class="num" data-field="range-max">{{ price(day.max) if day and day.available else '—' }}</strong></div>
+      </div>
+      <div class="range-track" aria-hidden="true"><i data-field="range-marker" style="left: {{ day.position_in_range_pct if day and day.available else 50 }}%"></i></div>
+      <div class="range-foot"><span data-field="range-position">{{ '%.0f%%'|format(day.position_in_range_pct) if day and day.available else '—' }} du range</span><span data-field="range-period">Période active : 24 h</span></div>
+    </section>
+
+    <section class="detail-secondary">
+      <article>
+        <h2>Fiabilité observable</h2>
+        <p data-field="observation-verdict">{{ item.observation.verdict }}</p>
+        <dl>
+          <div><dt>Jours observés</dt><dd data-field="observed-days">{{ item.observation.days_observed }}</dd></div>
+          <div><dt>Relevés</dt><dd data-field="samples">{{ item.observation.samples }}</dd></div>
+          <div><dt>Spread</dt><dd data-field="spread-stability">{{ item.observation.spread_stability or '—' }}</dd></div>
+          <div><dt>Volume habituel</dt><dd data-field="usual-volume">{{ compact(item.observation.usual_volume_24h) }} {{ item.quote_asset }}</dd></div>
+        </dl>
+      </article>
+      <article>
+        <h2>Historique personnel du bot</h2>
+        <p data-field="bot-assessment">{{ item.bot_history.assessment if item.bot_history.available else 'aucun historique bot' }}</p>
+        <dl>
+          <div><dt>Trades</dt><dd data-field="bot-trades">{{ item.bot_history.complete_trades if item.bot_history.available else '—' }}</dd></div>
+          <div><dt>PnL net</dt><dd class="num" data-field="bot-pnl">{{ '%.4f USDC'|format(item.bot_history.net_pnl_usdc) if item.bot_history.available else '—' }}</dd></div>
+          <div><dt>Meilleur</dt><dd class="num" data-field="bot-best">{{ '%.4f USDC'|format(item.bot_history.best_trade_usdc) if item.bot_history.available else '—' }}</dd></div>
+          <div><dt>Pire</dt><dd class="num" data-field="bot-worst">{{ '%.4f USDC'|format(item.bot_history.worst_trade_usdc) if item.bot_history.available else '—' }}</dd></div>
+        </dl>
+      </article>
+    </section>
+  </section>
 {%- endmacro %}
 
 {% block content %}
-<div class="page-content favorites-page">
-  <section class="favorites-head" aria-labelledby="favorites-title">
-    <div>
-      <p class="favorites-eyebrow">Carnet personnel</p>
-      <h1 id="favorites-title">Mes favoris</h1>
-      <p class="favorites-subtitle">
-        {% if payload.summary.latest_data_at %}Dernière mise à jour : {{ payload.summary.latest_data_at.replace('T', ' ')[:16] }} UTC{% else %}Les premières données publiques sont en cours de collecte.{% endif %}
-      </p>
-    </div>
-    <a class="favorites-refresh" href="{{ url_for('favorites') }}" title="Actualiser" aria-label="Actualiser">
-      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.58m14.84 2A7 7 0 005.58 9M20 20v-5h-.58m0 0A7 7 0 014.16 13"/></svg>
-    </a>
-  </section>
+<div class="page-content favorites-page" id="favorites-cockpit">
+  <header class="favorites-topline">
+    <div><p class="section-kicker">Watchlist personnelle</p><h1>Mes favoris</h1></div>
+    <p>{% if payload.summary.latest_data_at %}Mise à jour {{ payload.summary.latest_data_at.replace('T', ' ')[:16] }} UTC{% else %}Collecte des données publiques{% endif %}</p>
+  </header>
 
-  {% if payload.warnings %}<section class="favorites-notice" role="status">La source publique est momentanément indisponible. Les dernières observations locales restent affichées lorsqu’elles existent.</section>{% endif %}
-
-  <section class="overview-strip" aria-label="Vue d’ensemble de la watchlist">
-    <div><span>Favoris suivis</span><strong>{{ payload.overview.followed_count }}</strong></div>
-    <div><span>En hausse</span><strong>{{ payload.overview.rising_count }}</strong></div>
-    <div><span>En baisse</span><strong>{{ payload.overview.falling_count }}</strong></div>
-    <div><span>Stables</span><strong>{{ payload.overview.stable_count }}</strong></div>
-    <div><span>Très actifs</span><strong>{{ payload.overview.volatile_count }}</strong></div>
-    <div><span>À documenter</span><strong>{{ payload.overview.insufficient_count }}</strong></div>
-  </section>
-
-  {% if not payload['items'] %}
-    <section class="favorites-empty"><strong>Aucun favori configuré</strong><span>Ajoutez une paire spot dans <code>config/dashboard_favorites.yaml</code>.</span></section>
+  {% if not selected %}
+    <section class="favorites-empty"><strong>Aucun favori disponible</strong><span>Ajoutez une paire spot dans <code>config/dashboard_favorites.yaml</code>.</span></section>
   {% else %}
-    {% set tracked = payload['items']|selectattr('current_price')|list %}
-    {% if tracked %}
-      <section class="watchlist-section" aria-labelledby="today-title">
-        <header class="section-head"><div><h2 id="today-title">Mes favoris aujourd’hui</h2><p>Prix, range 24 h et lecture de comportement pour toute la watchlist.</p></div><span>{{ tracked|length }}</span></header>
-        <div class="favorite-grid">{% for item in tracked %}{{ favorite_card(item) }}{% endfor %}</div>
-      </section>
+    <div class="cockpit-layout">
+      <aside class="favorites-sidebar" aria-label="Liste des favoris">
+        <header><h2>Favoris</h2><span>{{ payload.overview.followed_count }}</span></header>
+        <nav id="favorite-list">
+          {% for item in payload['items'] %}
+            <a class="favorite-row {% if item.symbol == selected.symbol %}is-selected{% endif %} {% if item.current_price is none %}is-unavailable{% endif %}" href="{{ url_for('favorites', symbol=item.symbol) }}" data-symbol="{{ item.symbol }}" aria-current="{{ 'true' if item.symbol == selected.symbol else 'false' }}">
+              <span><strong>{{ item.display_symbol }}</strong><em>{{ item.watchlist.behavior }}</em></span>
+              <span class="favorite-row-price"><b class="num">{{ price(item.current_price) }}</b>{% if item.changes.change_24h_pct is not none %}<em class="{{ 'is-up' if item.changes.change_24h_pct > 0 else 'is-down' if item.changes.change_24h_pct < 0 else '' }}">{{ pct(item.changes.change_24h_pct) }}</em>{% endif %}</span>
+            </a>
+          {% endfor %}
+        </nav>
+      </aside>
 
-      <section class="watchlist-section" aria-labelledby="journey-title">
-        <header class="section-head"><div><h2 id="journey-title">Parcours dans le temps</h2><p>Les périodes locales apparaissent dès que leur historique est assez long.</p></div></header>
-        <div class="journey-list">{% for item in tracked %}{{ journey(item) }}{% endfor %}</div>
-      </section>
+      {{ selected_detail(selected) }}
 
-      {% set highlights = payload.overview.highlights %}
-      <section class="watchlist-section" aria-labelledby="close-title">
-        <header class="section-head"><div><h2 id="close-title">Favoris à suivre de près</h2><p>Repères pour choisir ce que vous souhaitez ouvrir dans Kraken Pro.</p></div></header>
-        <div class="highlight-grid">
-          {{ highlight('Le plus actif', highlights.most_active, highlights.most_active.watchlist.summary if highlights.most_active else '') }}
-          {{ highlight('Le plus régulier', highlights.most_regular, highlights.most_regular.observation.verdict if highlights.most_regular else '') }}
-          {{ highlight('Proche du bas', highlights.near_low, highlights.near_low.watchlist.range_reading if highlights.near_low else '') }}
-          {{ highlight('Proche du haut', highlights.near_high, highlights.near_high.watchlist.range_reading if highlights.near_high else '') }}
-          {{ highlight('Historique bot', highlights.best_bot_history, highlights.best_bot_history.bot_history.assessment if highlights.best_bot_history else '') }}
-        </div>
-      </section>
-    {% endif %}
-
-    {% if payload.missing_items %}
-      <section class="favorites-missing" aria-labelledby="missing-title">
-        <h2 id="missing-title">Données insuffisantes</h2>
-        <p>{{ payload.missing_items|map(attribute='display_symbol')|join(', ') }}. Paire indisponible ou historique local absent.</p>
-      </section>
-    {% endif %}
+      <aside class="watchlist-summary" aria-label="Résumé de la watchlist">
+        <header><h2>Repères</h2><p>Pour choisir quoi ouvrir dans Kraken Pro.</p></header>
+        {% set highlights = payload.overview.highlights %}
+        <dl>
+          <div><dt>Plus actif</dt><dd>{{ highlights.most_active.display_symbol if highlights.most_active else '—' }}</dd></div>
+          <div><dt>Plus en hausse</dt><dd>{{ highlights.strongest_variation.display_symbol if highlights.strongest_variation else '—' }}</dd></div>
+          <div><dt>Proche du bas</dt><dd>{{ highlights.near_low.display_symbol if highlights.near_low else '—' }}</dd></div>
+          <div><dt>Proche du haut</dt><dd>{{ highlights.near_high.display_symbol if highlights.near_high else '—' }}</dd></div>
+          <div><dt>Plus régulier</dt><dd>{{ highlights.most_regular.display_symbol if highlights.most_regular else '—' }}</dd></div>
+          <div><dt>Très actifs</dt><dd>{{ payload.overview.volatile_count }}</dd></div>
+        </dl>
+        {% if payload.missing_items %}<p class="summary-note">À documenter : {{ payload.missing_items|map(attribute='display_symbol')|join(', ') }}</p>{% endif %}
+      </aside>
+    </div>
   {% endif %}
 </div>
+{% endblock %}
+
+{% block scripts %}
+{% if selected %}
+<script id="favorite-initial-series" type="application/json">{{ initial_series|tojson }}</script>
+<script src="/static/favorites.js?v=20260903a"></script>
+<script>window.addEventListener('DOMContentLoaded', function () { window.startFavoritesCockpit({{ selected.symbol|tojson }}); });</script>
+{% endif %}
 {% endblock %}
