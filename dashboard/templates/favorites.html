@@ -2,7 +2,7 @@
 {% block title %}Favoris{% endblock %}
 
 {% block head_extra %}
-<link rel="stylesheet" href="/static/favorites.css?v=20260901c" />
+<link rel="stylesheet" href="/static/favorites.css?v=20260903a" />
 {% endblock %}
 
 {% macro price(value) -%}
@@ -27,31 +27,79 @@
   {%- endif -%}
 {%- endmacro %}
 
-{% macro sign_class(value) -%}
-  {%- if value is not none and value > 0 -%}profit
-  {%- elif value is not none and value < 0 -%}loss
-  {%- else -%}neutral
-  {%- endif -%}
-{%- endmacro %}
+{% macro token_card(item) -%}
+  <article class="favorite-decision-card group-{{ item.decision.group }}">
+    <header class="favorite-card-head">
+      <div>
+        <h3>{{ item.display_symbol }}</h3>
+        <span class="favorite-verdict verdict-{{ item.decision.group }}">{{ item.decision.verdict }}</span>
+      </div>
+      <div class="favorite-score" aria-label="Interest score {{ item.decision.interest_score }} sur 100">
+        <strong>{{ item.decision.interest_score }}</strong><span>/100</span>
+      </div>
+    </header>
 
-{% macro verdict_class(value) -%}
-  {%- if value == 'intéressant' -%}is-interesting
-  {%- elif value == 'à surveiller' -%}is-watch
-  {%- elif value in ('calme', 'données insuffisantes', 'données anciennes') -%}is-calm
-  {%- else -%}is-risk
-  {%- endif -%}
+    {% if item.decision.priority %}
+      <span class="favorite-priority priority-{{ item.decision.priority|lower }}">Priorité {{ item.decision.priority }}</span>
+    {% endif %}
+
+    <p class="favorite-reading">{{ item.decision.summary }}</p>
+    <p class="favorite-reason">{{ item.decision.reasons|join(' · ') }}</p>
+
+    <dl class="favorite-quick-facts">
+      <div><dt>Prix</dt><dd class="num">{{ price(item.current_price) }} {{ item.quote_asset }}</dd></div>
+      <div><dt>Position 24 h</dt><dd>{{ '%.0f%%'|format(item.decision.range_position_pct) if item.decision.range_position_pct is not none else '—' }}</dd></div>
+      <div><dt>Spread</dt><dd>{{ pct(item.market.spread_pct) }}</dd></div>
+    </dl>
+
+    <details class="favorite-detail">
+      <summary>Voir le contexte</summary>
+      <div class="favorite-detail-content">
+        {% set day = item.ranges.get('24h') %}
+        {% if day and day.available %}
+          <section>
+            <h4>Range 24 h</h4>
+            <p class="favorite-range-copy">
+              {{ price(day.min) }} → {{ price(day.max) }} {{ item.quote_asset }}
+              <span>· prix à {{ '%.0f%%'|format(day.position_in_range_pct) }} du range</span>
+            </p>
+          </section>
+        {% endif %}
+
+        {% if item.available_ranges|length > 1 %}
+          <section>
+            <h4>Historique local disponible</h4>
+            <div class="favorite-range-list">
+              {% for range in item.available_ranges if range.period != '24h' %}
+                <span><b>{{ range.period }}</b> {{ price(range.min) }} → {{ price(range.max) }}</span>
+              {% endfor %}
+            </div>
+          </section>
+        {% elif item.decision.history_note %}
+          <p class="favorite-history-note">{{ item.decision.history_note }} : la lecture utilise le range Kraken 24 h.</p>
+        {% endif %}
+
+        <section class="favorite-detail-metrics">
+          <div><span>Volume 24 h</span><strong>{{ compact(item.market.quote_volume_24h) }} {{ item.quote_asset }}</strong></div>
+          <div><span>Variation locale</span><strong>{{ pct(item.changes.change_1h_pct) }}</strong></div>
+          <div><span>Historique bot</span><strong>{{ item.bot_history.assessment }}</strong></div>
+        </section>
+      </div>
+    </details>
+  </article>
 {%- endmacro %}
 
 {% block content %}
 <div class="page-content favorites-page">
   <section class="favorites-head" aria-labelledby="favorites-title">
     <div>
-      <h1 id="favorites-title">Favoris</h1>
-      <p>
+      <p class="favorites-eyebrow">Analyse personnelle</p>
+      <h1 id="favorites-title">Quoi surveiller maintenant ?</h1>
+      <p class="favorites-subtitle">
         {% if payload.summary.latest_data_at %}
-          Dernière mise à jour : {{ payload.summary.latest_data_at.replace('T', ' ')[:16] }} UTC
+          {{ payload.summary.followed_count }} favoris suivis · données actualisées {{ payload.summary.latest_data_at.replace('T', ' ')[:16] }} UTC
         {% else %}
-          Données de favoris indisponibles
+          La lecture apparaîtra dès que des données publiques seront disponibles.
         {% endif %}
       </p>
     </div>
@@ -63,132 +111,71 @@
   </section>
 
   {% if payload.warnings %}
-    <section class="favorites-error" role="status">{{ payload.warnings|join(' · ') }}</section>
+    <section class="favorites-notice" role="status">Données publiques temporairement indisponibles : les dernières données locales restent affichées lorsqu’elles existent.</section>
   {% endif %}
 
-  <section class="favorites-summary" aria-label="Résumé des favoris">
-    {% set summary_items = [
-      ('À surveiller', payload.summary.best_to_watch, 'verdict'),
-      ('Le plus actif', payload.summary.most_active, 'change'),
-      ('Le plus calme', payload.summary.calmest, 'behavior'),
-      ('Le plus volatil', payload.summary.most_volatile, 'behavior'),
-      ('Vigilance', payload.summary.most_risky, 'risk')
-    ] %}
-    {% for label, item, kind in summary_items %}
-      <div class="favorite-summary-cell">
-        <span>{{ label }}</span>
-        {% if item %}
-          <strong>{{ item.display_symbol }}</strong>
-          {% if kind == 'change' %}
-            <small class="{{ sign_class(item.changes.change_5m_pct) }}">{{ pct(item.changes.change_5m_pct) }}</small>
-          {% elif kind == 'behavior' %}
-            <small>{{ item.behavior.summary }}</small>
-          {% elif kind == 'risk' %}
-            <small>{{ item.market.risk_label or item.market.risk_level or 'no data' }}</small>
-          {% else %}
-            <small>{{ item.verdict }}</small>
-          {% endif %}
-        {% else %}
-          <strong>—</strong><small>no data</small>
-        {% endif %}
-      </div>
-    {% endfor %}
-    <div class="favorite-summary-cell favorites-count">
-      <span>Suivis</span>
-      <strong class="num">{{ payload.summary.followed_count }}</strong>
-      <small>{{ 'données fraîches' if payload.summary.freshness.status == 'fresh' else 'données anciennes' if payload.summary.latest_data_at else 'no data' }}</small>
-    </div>
+  {% set cards = payload.summary.decision_cards %}
+  <section class="favorites-summary" aria-label="Synthèse immédiate">
+    <article class="favorites-summary-card">
+      <span>À surveiller</span>
+      {% if cards.best_to_watch %}
+        <strong>{{ cards.best_to_watch.display_symbol }}</strong>
+        <p>{{ cards.best_to_watch.decision.summary }}</p>
+      {% else %}
+        <strong>Rien de net</strong><p>Aucun favori ne réunit les conditions actuellement.</p>
+      {% endif %}
+    </article>
+    <article class="favorites-summary-card">
+      <span>Mouvement le plus propre</span>
+      {% if cards.cleanest_move %}
+        <strong>{{ cards.cleanest_move.display_symbol }}</strong>
+        <p>{{ cards.cleanest_move.decision.reasons[:2]|join(' · ') }}</p>
+      {% else %}
+        <strong>À confirmer</strong><p>Pas assez de données propres pour trancher.</p>
+      {% endif %}
+    </article>
+    <article class="favorites-summary-card">
+      <span>Plus forte accélération</span>
+      {% if cards.strongest_acceleration %}
+        <strong>{{ cards.strongest_acceleration.display_symbol }}</strong>
+        <p>{{ pct(cards.strongest_acceleration.decision.acceleration_pct) }} sur la dernière fenêtre locale disponible.</p>
+      {% else %}
+        <strong>À confirmer</strong><p>L’historique local est encore trop court.</p>
+      {% endif %}
+    </article>
+    <article class="favorites-summary-card is-risk">
+      <span>Risque de chase</span>
+      {% if cards.chase_risk %}
+        <strong>{{ cards.chase_risk.display_symbol }}</strong>
+        <p>Prix proche du haut de son range 24 h.</p>
+      {% else %}
+        <strong>Aucun évident</strong><p>Pas de favori classé trop haut actuellement.</p>
+      {% endif %}
+    </article>
+    <article class="favorites-summary-card is-muted">
+      <span>Données insuffisantes</span>
+      <strong>{{ cards.insufficient_count }}</strong>
+      <p>Favori{{ 's' if cards.insufficient_count != 1 else '' }} regroupé{{ 's' if cards.insufficient_count != 1 else '' }} plus bas.</p>
+    </article>
   </section>
 
-  {% if not payload['items'] %}
-    <section class="favorites-empty">
-      <strong>no data</strong>
-      <span>Aucun favori personnel configuré ou aucune donnée disponible.</span>
-    </section>
+  {% if not payload.items %}
+    <section class="favorites-empty"><strong>Aucun favori configuré</strong><span>Ajoutez une paire spot dans <code>config/dashboard_favorites.yaml</code>.</span></section>
   {% else %}
-    <section class="favorites-server-list" aria-labelledby="favorites-list-title">
-      <header class="favorites-section-heading">
-        <div>
-          <h2 id="favorites-list-title">Lecture des favoris</h2>
-          <span>{{ payload['items']|length }} suivi{{ 's' if payload['items']|length > 1 else '' }}</span>
-        </div>
-      </header>
-
-      {% for item in payload['items'] %}
-        <details class="favorite-server-item" {% if loop.first %}open{% endif %}>
-          <summary>
-            <div class="favorite-row-title">
-              <strong>{{ item.display_symbol }}</strong>
-              <span class="favorite-verdict {{ verdict_class(item.verdict) }}">{{ item.verdict }}</span>
-            </div>
-            <div class="favorite-row-price">
-              <strong class="num">{{ price(item.current_price) }}</strong>
-              <span class="{{ sign_class(item.changes.change_1h_pct) }}">{{ pct(item.changes.change_1h_pct) }}</span>
-            </div>
-            <p>{{ item.behavior.summary }} · scalping {{ item.scalping_quality.label }} · {{ item.data_error or item.market.risk_label or item.market.risk_level or 'risque no data' }}</p>
-          </summary>
-
-          <div class="favorite-server-detail">
-            <section class="favorite-detail-block">
-              <header class="favorite-detail-block-head"><h3>Min / max par durée</h3><span>prix observés</span></header>
-              <div class="favorite-ranges">
-                {% for period in range_periods %}
-                  {% set range = item.ranges.get(period) %}
-                  <div class="favorite-range-row {% if not range.available %}is-unavailable{% endif %}">
-                    <span>{{ period }}</span>
-                    {% if range.available %}
-                      <strong class="num">{{ price(range.min) }} – {{ price(range.max) }}</strong>
-                      <em>{{ '%.0f%%'|format(range.position_in_range_pct) }} dans le range · min {{ pct(range.distance_from_min_pct) }} · max {{ pct(range.distance_to_max_pct) }}</em>
-                    {% else %}
-                      <strong>no data</strong><em>donnée absente</em>
-                    {% endif %}
-                  </div>
-                {% endfor %}
-              </div>
-            </section>
-
-            <section class="favorite-detail-block favorite-detail-two-col">
-              <div>
-                <header class="favorite-detail-block-head"><h3>Comportement</h3><span>{{ item.behavior.summary }}</span></header>
-                <div class="favorite-tags">
-                  {% for label in item.behavior.labels %}<span>{{ label }}</span>{% endfor %}
-                </div>
-                <dl class="favorite-facts">
-                  <div><dt>5 min</dt><dd class="{{ sign_class(item.changes.change_5m_pct) }}">{{ pct(item.changes.change_5m_pct) }}</dd></div>
-                  <div><dt>1 h</dt><dd class="{{ sign_class(item.changes.change_1h_pct) }}">{{ pct(item.changes.change_1h_pct) }}</dd></div>
-                  <div><dt>24 h</dt><dd class="{{ sign_class(item.changes.change_24h_pct) }}">{{ pct(item.changes.change_24h_pct) }}</dd></div>
-                </dl>
-              </div>
-              <div>
-                <header class="favorite-detail-block-head"><h3>Qualité scalping</h3><span class="scalping-{{ item.scalping_quality.grade }}">{{ item.scalping_quality.label }}</span></header>
-                <p class="favorite-copy">{{ item.scalping_quality.reason }}</p>
-                <dl class="favorite-facts">
-                  <div><dt>Spread</dt><dd>{{ pct(item.market.spread_pct) }}</dd></div>
-                  <div><dt>Volume 24 h</dt><dd>{{ compact(item.market.quote_volume_24h) }} {{ item.quote_asset }}</dd></div>
-                  <div><dt>Trades 24 h</dt><dd>{{ item.market.trade_count_24h if item.market.trade_count_24h is not none else '—' }}</dd></div>
-                </dl>
-              </div>
-            </section>
-
-            <section class="favorite-detail-block">
-              <header class="favorite-detail-block-head"><h3>Historique personnel du bot</h3><span class="history-{{ 'none' if not item.bot_history.available else 'limited' }}">{{ item.bot_history.assessment }}</span></header>
-              {% if item.bot_history.available %}
-                <div class="favorite-history-grid">
-                  <div><span>Trades complets</span><strong class="num">{{ item.bot_history.complete_trades }}</strong></div>
-                  <div><span>PnL net</span><strong class="num {{ sign_class(item.bot_history.net_pnl_usdc) }}">{{ '%.4f USDC'|format(item.bot_history.net_pnl_usdc) if item.bot_history.net_pnl_usdc is not none else '—' }}</strong></div>
-                  <div><span>Meilleur</span><strong class="num profit">{{ '%.4f USDC'|format(item.bot_history.best_trade_usdc) if item.bot_history.best_trade_usdc is not none else '—' }}</strong></div>
-                  <div><span>Pire</span><strong class="num loss">{{ '%.4f USDC'|format(item.bot_history.worst_trade_usdc) if item.bot_history.worst_trade_usdc is not none else '—' }}</strong></div>
-                  <div><span>Dernière activité</span><strong>{{ item.bot_history.last_activity or '—' }}</strong></div>
-                  <div><span>Sorties fréquentes</span><strong>{{ item.bot_history.frequent_exits|map(attribute='reason')|join(', ') or '—' }}</strong></div>
-                </div>
-              {% else %}
-                <p class="favorite-no-history">no bot trade history</p>
-              {% endif %}
-            </section>
+    {% for group in payload.groups if group['items'] %}
+      <section class="favorite-group favorite-group-{{ group.key }}" aria-labelledby="favorites-group-{{ group.key }}">
+        <header class="favorite-group-head">
+          <div>
+            <h2 id="favorites-group-{{ group.key }}">{{ group.title }}</h2>
+            <p>{{ group.description }}</p>
           </div>
-        </details>
-      {% endfor %}
-    </section>
+          <span>{{ group['items']|length }}</span>
+        </header>
+        <div class="favorite-decision-grid">
+          {% for item in group['items'] %}{{ token_card(item) }}{% endfor %}
+        </div>
+      </section>
+    {% endfor %}
   {% endif %}
 </div>
 {% endblock %}

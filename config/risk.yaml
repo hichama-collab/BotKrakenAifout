@@ -647,3 +647,13 @@ dashboard:
     scalping_good_quote_volume_24h: 1000000
     scalping_clean_reliability_score: 70
     history_min_trades_for_signal: 3
+    # Classement de la page /favorites uniquement. Ces valeurs ne sont jamais
+    # lues par le bot live, les stratégies ou l'exécution des ordres.
+    watch_min_interest_score: 60
+    high_priority_interest_score: 75
+    medium_priority_interest_score: 60
+    strong_move_pct: 0.12
+    too_high_range_position_pct: 85
+    dead_move_pct: 0.01
+    dead_range_pct: 0.012
+    high_range_24h_pct: 0.25
