@@ -52,7 +52,13 @@ def _internal_status(row: dict) -> str:
     return str(row.get("status") or "UNKNOWN").upper()
 
 
-def map_kraken_order(symbol: str, order_id: str, row: dict, client_order_id: str = "") -> dict:
+def map_kraken_order(
+    symbol: str,
+    order_id: str,
+    row: dict,
+    client_order_id: str = "",
+    fee_asset: str = "",
+) -> dict:
     descr = row.get("descr") if isinstance(row.get("descr"), dict) else {}
     side = str(descr.get("type") or row.get("type") or "").upper()
     try:
@@ -69,7 +75,7 @@ def map_kraken_order(symbol: str, order_id: str, row: dict, client_order_id: str
     try:
         fee_f = float(fee or 0.0)
         if fee_f > 0:
-            fills.append({"commission": str(fee_f), "commissionAsset": ""})
+            fills.append({"commission": str(fee_f), "commissionAsset": str(fee_asset or "")})
     except Exception:
         pass
     return {
@@ -142,7 +148,12 @@ def getOrder(bx, symbol: str, orderId: str):
     row = (result or {}).get(str(orderId))
     if not isinstance(row, dict):
         return {"symbol": symbol, "orderId": str(orderId), "status": "UNKNOWN", "executedQty": "0"}
-    return map_kraken_order(symbol, str(orderId), row)
+    fee_asset = ""
+    try:
+        fee_asset = str(bx.resolve_pair(symbol).quote_asset or "")
+    except Exception:
+        pass
+    return map_kraken_order(symbol, str(orderId), row, fee_asset=fee_asset)
 
 
 def cancelOrder(bx, symbol: str, orderId: str):
@@ -150,10 +161,41 @@ def cancelOrder(bx, symbol: str, orderId: str):
     return {"symbol": symbol, "orderId": str(orderId), "status": "CANCEL_SENT", "raw": result}
 
 
+def _compact_pair(value: object) -> str:
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+
+def _order_belongs_to_pair(bx, symbol: str, row: dict) -> bool:
+    """Fail closed when an OpenOrders row cannot be tied to the active pair."""
+    descr = row.get("descr") if isinstance(row.get("descr"), dict) else {}
+    raw_pair = descr.get("pair") or row.get("pair")
+    if not raw_pair:
+        return False
+    try:
+        meta = bx.resolve_pair(symbol)
+        expected = {
+            _compact_pair(meta.pair_id),
+            _compact_pair(meta.symbol),
+            _compact_pair(meta.ws_symbol),
+        }
+    except Exception:
+        expected = {_compact_pair(symbol)}
+    return _compact_pair(raw_pair) in expected
+
+
 def openOrders(bx, symbol: str):
     result = bx.post("/0/private/OpenOrders", {"trades": True})
     rows = ((result or {}).get("open") or {}) if isinstance(result, dict) else {}
-    return [map_kraken_order(symbol, oid, row) for oid, row in rows.items() if isinstance(row, dict)]
+    fee_asset = ""
+    try:
+        fee_asset = str(bx.resolve_pair(symbol).quote_asset or "")
+    except Exception:
+        pass
+    return [
+        map_kraken_order(symbol, oid, row, fee_asset=fee_asset)
+        for oid, row in rows.items()
+        if isinstance(row, dict) and _order_belongs_to_pair(bx, symbol, row)
+    ]
 
 
 def order_fee_summary(order: dict, fallback_qty: float = 0.0, fallback_quote: float = 0.0) -> dict:

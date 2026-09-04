@@ -6,7 +6,7 @@ from typing import Optional
 from state.position import Position
 
 
-_QUOTE_OR_NON_POSITION_ASSETS = {"USDC", "USDT", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "EUR"}
+_QUOTE_OR_NON_POSITION_ASSETS = {"USDC", "USDT", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "USD", "EUR"}
 
 
 def _safe_book_bid(bx, symbol: str) -> float:
@@ -36,8 +36,21 @@ def _balance_qty(balance: dict) -> tuple[float, float, float]:
     return free, locked, free + locked
 
 
-def _wallet_holdings(balances: list, bid_map: dict, min_notional: float) -> list:
+def _wallet_holdings(
+    balances: list,
+    bid_map: dict,
+    min_notional: float,
+    quote_asset: str,
+) -> list:
+    """Keep externally held assets visible even when no direct quote pair exists.
+
+    A missing ``ASSET/QUOTE`` ticker is not evidence of dust.  In particular,
+    Kraken can hold an asset through a USD or EUR manual order while the bot is
+    configured for USDC.  Such a holding must remain visible and block a new
+    automated entry rather than silently disappearing from portfolio state.
+    """
     holdings = []
+    quote = str(quote_asset or "USDC").upper()
     for b in balances:
         asset = str(b.get("asset", "")).upper()
         if not asset or asset in _QUOTE_OR_NON_POSITION_ASSETS:
@@ -48,10 +61,12 @@ def _wallet_holdings(balances: list, bid_map: dict, min_notional: float) -> list
             continue
         if qty <= 0:
             continue
-        symbol = f"{asset}{os.getenv('QUOTE_ASSET', 'USDC').upper()}"
+        symbol = f"{asset}{quote}"
         bid = float(bid_map.get(symbol, 0.0) or 0.0)
-        notional = qty * bid if bid > 0 else 0.0
-        if notional < float(min_notional):
+        notional = qty * bid if bid > 0 else None
+        # Known, valued dust does not affect the one-position guard.  An
+        # unvalued holding is retained as an explicit safety condition.
+        if notional is not None and notional < float(min_notional):
             continue
         holdings.append({
             "asset": asset,
@@ -61,8 +76,9 @@ def _wallet_holdings(balances: list, bid_map: dict, min_notional: float) -> list
             "qty": qty,
             "bid": bid,
             "notional": notional,
+            "valuation_status": "VALUED" if notional is not None else "UNVALUED_NO_DIRECT_QUOTE",
         })
-    holdings.sort(key=lambda h: h["notional"], reverse=True)
+    holdings.sort(key=lambda h: (h["notional"] is not None, h["notional"] or 0.0), reverse=True)
     return holdings
 
 
@@ -89,9 +105,17 @@ def _safe_write_json(path: Path, data: object) -> None:
 
 
 def _clear_entry_unknown(sync_state: dict) -> None:
-    if sync_state.get("status") != "ENTRY_UNKNOWN":
+    if sync_state.get("status") not in {"ENTRY_UNKNOWN", "EXTERNAL_HOLDING"}:
         return
-    for key in ("status", "reason", "symbol", "qty"):
+    for key in (
+        "status",
+        "reason",
+        "symbol",
+        "qty",
+        "external_asset",
+        "external_symbol",
+        "external_holding_key",
+    ):
         sync_state.pop(key, None)
 
 
@@ -323,24 +347,42 @@ def walletSyncEvery(
     notional = (qty_now * bid) if (qty_now > 0 and bid > 0) else 0.0
     dust_frac = float(getattr(cfg, "dustStepFraction", 0.5))
     qty_floor = float(step) * dust_frac
-    holdings = _wallet_holdings(balances, bid_map, float(minNotional))
-    external_holding = next((h for h in holdings if h.get("symbol") != symbol), None)
+    holdings = _wallet_holdings(balances, bid_map, float(minNotional), quote_asset)
+    external_holding = next((h for h in holdings if h.get("asset") != base), None)
+
+    # A manual holding on another Kraken pair is not a bot position.  Do not
+    # adopt it, infer an entry, or rewrite SYMBOL.  Keeping the bot flat and
+    # blocking fresh entries is the only safe one-position behaviour.
+    if external_holding is not None and pos is None:
+        previous_external_key = syncState.get("external_holding_key")
+        _clear_entry_unknown(syncState)
+        external_key = f"{external_holding['asset']}:{external_holding['qty']}:{external_holding['locked']}"
+        is_new_external_holding = previous_external_key != external_key
+        syncState.update({
+            "status": "EXTERNAL_HOLDING",
+            "reason": "external_symbol_found",
+            "external_asset": external_holding["asset"],
+            "external_symbol": external_holding["symbol"],
+            "external_holding_key": external_key,
+        })
+        _write_runtime_snapshot(now, symbol, acc, balances, None, "external_symbol_found", holdings)
+        return None, syncState, {
+            "changed": True,
+            "external_holding_new": is_new_external_holding,
+            "status": "EXTERNAL_HOLDING",
+            "usdc": free_usdc,
+            "reason": "external_symbol_found",
+            "external_symbol": external_holding["symbol"],
+            "external_asset": external_holding["asset"],
+            "wallet_qty": external_holding["qty"],
+            "wallet_notional": external_holding["notional"],
+            "valuation_status": external_holding["valuation_status"],
+            "holdings": holdings,
+        }
 
     if qty_now <= qty_floor:
         _clear_entry_unknown(syncState)
         reason = "wallet_cleared" if pos is not None else "wallet_empty"
-        if external_holding is not None and pos is None:
-            _write_runtime_snapshot(now, symbol, acc, balances, None, "external_symbol_found", holdings)
-            return None, syncState, {
-                "changed": True,
-                "usdc": free_usdc,
-                "reason": "external_symbol_found",
-                "external_symbol": external_holding["symbol"],
-                "external_asset": external_holding["asset"],
-                "wallet_qty": external_holding["qty"],
-                "wallet_notional": external_holding["notional"],
-                "holdings": holdings,
-            }
         guard_until = (
             _record_flat_guard(now, symbol, cfg, reason, qty_now, notional)
             if pos is not None
@@ -372,17 +414,6 @@ def walletSyncEvery(
                 "wallet_qty": qty_now,
                 "wallet_notional": notional,
                 "entry_block_until": guard_until,
-                "holdings": holdings,
-            }
-        if external_holding is not None:
-            return None, syncState, {
-                "changed": True,
-                "usdc": free_usdc,
-                "reason": "external_symbol_found",
-                "external_symbol": external_holding["symbol"],
-                "external_asset": external_holding["asset"],
-                "wallet_qty": external_holding["qty"],
-                "wallet_notional": external_holding["notional"],
                 "holdings": holdings,
             }
         return None, syncState, {

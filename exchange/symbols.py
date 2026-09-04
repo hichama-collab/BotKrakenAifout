@@ -147,5 +147,7 @@ class SymbolMapper:
 def initSymbol(bx, symbol: str):
     mapper = getattr(bx, "symbol_mapper", SymbolMapper(bx))
     meta = mapper.resolve_pair(symbol)
-    min_notional = float(meta.min_notional or (meta.min_order_volume * meta.tick))
+    # ``ordermin * tick`` is a price, not an order cost.  A quote minimum can
+    # only be represented statically when Kraken supplies ``costmin``.
+    min_notional = float(meta.min_notional or 0)
     return float(meta.tick), float(meta.step), meta.tick, meta.step, min_notional

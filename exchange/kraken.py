@@ -173,15 +173,93 @@ class Kraken:
         return self.resolve_pair(symbol).base_asset
 
     def account_balances(self) -> dict:
-        result = self.post("/0/private/Balance", {})
+        """Return Kraken balances with spendable and held amounts separated.
+
+        ``Balance`` only exposes a total.  Treating that total as free makes a
+        manually held limit order look available to the bot.  ``BalanceEx``
+        exposes ``hold_trade`` and therefore lets wallet sync remain
+        authoritative without guessing.
+        """
+        try:
+            result = self.post("/0/private/BalanceEx", {})
+            source = "BalanceEx"
+        except KrakenApiError:
+            # Some legacy keys do not have the query-funds permission required
+            # by BalanceEx.  Preserve read-only compatibility, while exposing
+            # the weaker source to callers instead of inventing a lock value.
+            result = self.post("/0/private/Balance", {})
+            source = "Balance"
+
         balances = []
         for asset, value in (result or {}).items():
             try:
-                qty = float(value or 0.0)
+                if source == "BalanceEx" and isinstance(value, dict):
+                    total = float(value.get("balance", 0.0) or 0.0)
+                    held = max(0.0, float(value.get("hold_trade", 0.0) or 0.0))
+                    available_raw = value.get("available")
+                    if available_raw in (None, ""):
+                        available = (
+                            total
+                            + float(value.get("credit", 0.0) or 0.0)
+                            - float(value.get("credit_used", 0.0) or 0.0)
+                            - held
+                        )
+                    else:
+                        available = float(available_raw)
+                    free = max(0.0, available)
+                    locked = held
+                else:
+                    total = float(value or 0.0)
+                    free = total
+                    locked = 0.0
             except Exception:
-                qty = 0.0
-            balances.append({"asset": _asset_display(asset), "free": str(qty), "locked": "0"})
-        return {"balances": balances, "raw": result or {}}
+                total = free = locked = 0.0
+            balances.append({
+                "asset": _asset_display(asset),
+                "raw_asset": str(asset),
+                "free": str(free),
+                "locked": str(locked),
+                "total": str(total),
+            })
+        return {
+            "balances": balances,
+            "raw": result or {},
+            "source": source,
+            "available_exact": source == "BalanceEx",
+        }
+
+    def trade_fee_rates(self, symbol: str) -> dict:
+        """Return the account's current Kraken fee schedule for one pair.
+
+        Kraken reports percentages (for example ``0.26`` for 0.26%), while the
+        bot uses decimal rates.  LIMIT orders are not assumed to be maker
+        orders: without post-only they may take liquidity, so callers use the
+        taker rate for conservative entry and exit protection.
+        """
+        meta = self.resolve_pair(symbol)
+        result = self.post("/0/private/TradeVolume", {"pair": meta.pair_id}) or {}
+
+        def _pair_fee(section: str) -> float:
+            rows = result.get(section) if isinstance(result, dict) else {}
+            if not isinstance(rows, dict):
+                raise KrakenApiError(["EGeneral:TradeVolume missing fee schedule"], "/0/private/TradeVolume")
+            row = rows.get(meta.pair_id)
+            if row is None and len(rows) == 1:
+                row = next(iter(rows.values()))
+            if not isinstance(row, dict):
+                raise KrakenApiError(["EGeneral:TradeVolume missing pair fee"], "/0/private/TradeVolume")
+            rate = float(row.get("fee", 0.0) or 0.0) / 100.0
+            if rate < 0:
+                raise KrakenApiError(["EGeneral:TradeVolume invalid fee"], "/0/private/TradeVolume")
+            return rate
+
+        return {
+            "symbol": meta.symbol,
+            "pair_id": meta.pair_id,
+            "taker": _pair_fee("fees"),
+            "maker": _pair_fee("fees_maker"),
+            "source": "kraken_trade_volume",
+        }
 
     def ticker(self, symbol: str | None = None):
         params = {}

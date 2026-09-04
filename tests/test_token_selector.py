@@ -91,29 +91,8 @@ class CandidateWindowTests(unittest.TestCase):
         ):
             self.assertTrue(selector._candidate_window_is_eligible(0.30, 0.05))
 
-    def test_top_mover_fallback_selects_highest_positive_variation(self):
-        movers = [
-            {"symbol": "ETHUSDC", "pct": 0.10, "spread_pct": 0.01},
-            {"symbol": "VIRTUALUSDC", "pct": 2.42, "spread_pct": 0.15},
-            {"symbol": "BTCUSDC", "pct": 0.13, "spread_pct": 0.01},
-        ]
-        with (
-            patch.object(selector, "SELECTOR_TOP_MOVER_FALLBACK", True),
-            patch.object(selector, "collect_top_movers", return_value=movers),
-        ):
-            chosen, ranked = selector.choose_top_mover_fallback(set(), {})
-
-        self.assertEqual(chosen["symbol"], "VIRTUALUSDC")
-        self.assertEqual([item["symbol"] for item in ranked], ["VIRTUALUSDC", "BTCUSDC", "ETHUSDC"])
-
-    def test_top_mover_fallback_reuses_tradability_gates(self):
-        expected = [{"symbol": "SOLUSDC", "pct": 0.42, "spread_pct": 0.03}]
-        with patch.object(selector, "collect_candidates", return_value=expected):
-            assert selector.collect_top_movers({"BTCUSDC"}) == expected
-
-
 class KrakenTickerTests(unittest.TestCase):
-    def test_market_stats_uses_kraken_utc_session_open(self):
+    def test_market_stats_keeps_utc_session_change_out_of_rolling_24h_gate(self):
         class Response:
             def raise_for_status(self):
                 return None
@@ -138,37 +117,26 @@ class KrakenTickerTests(unittest.TestCase):
         ):
             stats = selector.get_market_stats_map()
 
-        self.assertEqual(stats["BTCUSDC"]["change_pct_24h"], 10.0)
+        self.assertIsNone(stats["BTCUSDC"]["change_pct_24h"])
+        self.assertEqual(stats["BTCUSDC"]["session_change_pct"], 10.0)
 
 
-class TradableAnchorTests(unittest.TestCase):
-    def test_anchor_replaces_only_an_untradable_active_symbol(self):
-        markets = {
-            "BTCUSDC": {
-                "last_price": 100.0,
-                "quote_volume_24h": 9_000_000.0,
-                "trade_count_24h": 10_000,
-                "change_pct_24h": 1.0,
-            },
-            "XMRUSDC": {
-                "last_price": 100.0,
-                "quote_volume_24h": 100_000.0,
-                "trade_count_24h": 100,
-                "change_pct_24h": 1.0,
-            },
-        }
-        with (
-            patch.object(selector, "get_symbols_usdc_trading", return_value=["BTCUSDC", "XMRUSDC"]),
-            patch.object(selector, "get_spread_map", return_value={"BTCUSDC": 0.0001, "XMRUSDC": 0.003}),
-            patch.object(selector, "get_market_stats_map", return_value=markets),
-        ):
-            anchor, current_is_tradable = selector.choose_tradable_anchor("XMRUSDC")
-            no_anchor, btc_is_tradable = selector.choose_tradable_anchor("BTCUSDC")
+class Rolling24hTests(unittest.TestCase):
+    def test_rolling_24h_uses_288_five_minute_bars(self):
+        bars = [
+            [index * 300, "100", "101", "99", "100", "0"]
+            for index in range(287)
+        ]
+        bars.append([287 * 300, "100", "105", "99", "110", "0"])
+        with patch.object(selector, "_recent_ohlc_bars_for_interval", return_value=bars) as fetch:
+            change = selector.rolling_24h_change_pct("BTCUSDC")
 
-        self.assertFalse(current_is_tradable)
-        self.assertEqual(anchor["symbol"], "BTCUSDC")
-        self.assertIsNone(no_anchor)
-        self.assertTrue(btc_is_tradable)
+        fetch.assert_called_once_with("BTCUSDC", interval=5)
+        self.assertEqual(change, 10.0)
+
+    def test_missing_rolling_history_is_not_treated_as_zero_change(self):
+        with patch.object(selector, "_recent_ohlc_bars_for_interval", return_value=[]):
+            self.assertIsNone(selector.rolling_24h_change_pct("BTCUSDC"))
 
 
 class SelectorObservabilityTests(unittest.TestCase):
@@ -246,7 +214,7 @@ class RecentHighFilterTests(unittest.TestCase):
                 (105.0 - 104.0) / 105.0,
             )
 
-    def test_pick_best_uses_top_candidate_after_all_recent_high_rejections(self):
+    def test_pick_best_never_bypasses_recent_high_rejection(self):
         ranked = [{"symbol": "BTCUSDC", "pct": 0.30, "spread_pct": 0.02, "is_toxic": False}]
         with (
             patch.object(selector, "collect_candidates", return_value=ranked),
@@ -254,12 +222,10 @@ class RecentHighFilterTests(unittest.TestCase):
             patch.object(selector, "current_direction_pct", return_value=0.10),
             patch.object(selector, "distance_from_recent_high_pct", return_value=0.0001),
             patch.object(selector, "SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT", 0.0020),
-            patch.object(selector, "SELECTOR_FALLBACK_ON_RECENT_HIGH", True),
         ):
             chosen, _ = selector.pick_best_candidate({})
 
-        self.assertEqual(chosen["symbol"], "BTCUSDC")
-        self.assertEqual(chosen["selection_mode"], "RECENT_HIGH_FALLBACK")
+        self.assertIsNone(chosen)
 
 
 if __name__ == "__main__":

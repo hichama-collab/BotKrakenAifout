@@ -28,3 +28,32 @@ def test_round_trip_cost():
     fm = FeeModel(fee_rate=0.001)
     cost = fm.estimate_round_trip_cost(10.0)
     assert cost == pytest.approx(0.02, abs=1e-6)
+
+
+def test_uses_kraken_taker_rate_when_limit_order_is_not_post_only():
+    fm = FeeModel(
+        fee_rate=0.001,
+        fee_rate_resolver=lambda symbol: {"taker": 0.0035, "maker": 0.002, "source": "kraken_trade_volume"},
+    )
+
+    info = fm.refresh_fee_rate("ADAUSDC")
+
+    assert info["source"] == "kraken_trade_volume"
+    assert fm.fee_rate == pytest.approx(0.0035)
+
+
+def test_actual_fill_fees_override_the_schedule_estimate_for_pnl():
+    fm = FeeModel(fee_rate=0.0035)
+
+    result = fm.compute_net_pnl(
+        1.0,
+        10.0,
+        1.1,
+        10.0,
+        actual_fees_buy=0.01,
+        actual_fees_sell=0.02,
+    )
+
+    assert result["fees_buy"] == pytest.approx(0.01)
+    assert result["fees_sell"] == pytest.approx(0.02)
+    assert result["net_pnl"] == pytest.approx(0.97)

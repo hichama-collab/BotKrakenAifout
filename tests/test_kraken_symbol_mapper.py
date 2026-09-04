@@ -1,6 +1,6 @@
 import pytest
 
-from exchange.symbols import SymbolMapper, SymbolNotFound
+from exchange.symbols import SymbolMapper, SymbolNotFound, initSymbol
 
 
 ASSET_PAIRS = {
@@ -53,3 +53,29 @@ def test_symbol_mapper_resolves_eth():
 def test_symbol_mapper_pair_not_found_is_clear():
     with pytest.raises(SymbolNotFound, match="not found"):
         SymbolMapper(FakeClient(), "USDC").resolve_pair("NOPE/USDC")
+
+
+def test_init_symbol_does_not_mistake_quantity_times_tick_for_min_notional():
+    pairs = {
+        "TESTUSDC": {
+            "altname": "TESTUSDC",
+            "wsname": "TEST/USDC",
+            "base": "TEST",
+            "quote": "USDC",
+            "pair_decimals": 4,
+            "lot_decimals": 2,
+            "ordermin": "10",
+            "tick_size": "0.0001",
+        }
+    }
+
+    class NoCostMinClient:
+        def get(self, path, params=None, signed=False):
+            return pairs
+
+    client = NoCostMinClient()
+    client.symbol_mapper = SymbolMapper(client, "USDC")
+
+    *_unused, min_notional = initSymbol(client, "TESTUSDC")
+
+    assert min_notional == 0.0

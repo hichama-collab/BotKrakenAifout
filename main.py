@@ -5,6 +5,7 @@ import os
 import json
 from pathlib import Path
 from decimal import Decimal, ROUND_CEILING
+from dataclasses import replace
 
 from typing import Optional
 from execution.fee_model import FeeModel
@@ -626,7 +627,17 @@ def get_symbol_filters(bx: Kraken, symbol: str):
         meta = bx.resolve_pair(symbol)
     except Exception as e:
         raise RuntimeError(f"Invalid Kraken spot symbol: {symbol}") from e
-    return float(meta.tick), float(meta.step), float(meta.min_notional or 0.0)
+    min_notional = float(meta.min_notional or 0.0)
+    if min_notional <= 0 and float(meta.min_order_volume or 0.0) > 0:
+        # Kraken's ordermin is a base quantity.  Convert it with a live price;
+        # multiplying it by tick size would produce a meaningless quote value.
+        try:
+            bid, ask = bx.best_bid_ask(symbol)
+            reference_price = max(float(bid or 0.0), float(ask or 0.0))
+            min_notional = float(meta.min_order_volume) * reference_price
+        except Exception:
+            min_notional = 0.0
+    return float(meta.tick), float(meta.step), min_notional
 
 
 def get_account_with_retry(bx: Kraken, cfg):
@@ -929,7 +940,19 @@ def main():
     _fee_model = FeeModel(
         fee_rate=float(getattr(cfg, 'defaultFeeRate', 0.001)),
         use_bnb=bool(getattr(cfg, 'useBnbForFees', False)),
+        fee_rate_resolver=getattr(bx, "trade_fee_rates", None),
     )
+    if not bool(getattr(cfg, "dryRun", False)):
+        _fee_rate_info = _fee_model.refresh_fee_rate(symbol)
+        # Config is immutable.  Replacing its runtime value keeps existing TP
+        # and common-exit fee calculations aligned with the verified Kraken
+        # schedule without introducing a second set of thresholds.
+        cfg = replace(cfg, defaultFeeRate=float(_fee_model.fee_rate))
+        logTrade(
+            f"FEE_RATE symbol={symbol} rate={float(_fee_model.fee_rate):.8f} "
+            f"source={_fee_rate_info.get('source','config')} "
+            f"cached={int(bool(_fee_rate_info.get('cached')))}"
+        )
     _circuit_breaker = CircuitBreaker(
         daily_max_loss_usdc=float(getattr(cfg, 'dailyMaxLossUsdc', 1.0)),
         max_consecutive_losses=int(getattr(cfg, 'maxConsecutiveLosses', 5)),
@@ -1277,17 +1300,17 @@ def main():
 
         if sync_reason == "external_symbol_found" and pos is None:
             external_symbol = str(syncInfo.get("external_symbol") or "").upper()
-            if external_symbol and external_symbol != symbol:
+            if bool(syncInfo.get("external_holding_new")):
                 try:
                     logTrade(
-                        f"WALLET_EXTERNAL_POSITION_FOUND current={symbol} "
-                        f"external={external_symbol} qty={syncInfo.get('wallet_qty','')} "
-                        f"notional={syncInfo.get('wallet_notional','')}"
+                        f"WALLET_EXTERNAL_HOLDING_BLOCK current={symbol} "
+                        f"external={external_symbol or '-'} asset={syncInfo.get('external_asset','')} "
+                        f"qty={syncInfo.get('wallet_qty','')} notional={syncInfo.get('wallet_notional','')} "
+                        f"valuation={syncInfo.get('valuation_status','')}"
                     )
                 except Exception:
                     pass
-                _write_service_env_symbol(external_symbol, log_fn=logTrade)
-                _reexec_to_symbol(symbol, external_symbol, source="wallet_external_position", log_fn=logTrade)
+            return
 
         if sync_reason in ("wallet_cleared", "wallet_dust") and bool(syncInfo.get("changed")):
             entry_block_until = float(syncInfo.get("entry_block_until", 0.0) or 0.0)
@@ -1480,6 +1503,11 @@ def main():
             except (TypeError, ValueError):
                 quote_free = None
             quoteSizing = quote_sizing_diagnostic(quote_free)
+            external_holding_block = str(syncState.get("status") or "") == "EXTERNAL_HOLDING"
+            runtime_blocking_reason = (
+                "EXTERNAL_HOLDING" if external_holding_block else quoteSizing["blocking_reason"]
+            )
+            runtime_can_buy = bool(quoteSizing["can_buy"]) and not external_holding_block
             log_quote_balance_diagnostic(quoteSizing)
             
             # cooldown log so it doesn't look frozen
@@ -1684,9 +1712,9 @@ def main():
                 "min_notional": quoteSizing["min_notional"],
                 "sizing_cap": quoteSizing["sizing_cap"],
                 "qty_estimated": None,
-                "sizing_ok": quoteSizing["can_buy"],
-                "can_buy": quoteSizing["can_buy"],
-                "blocking_reason": quoteSizing["blocking_reason"],
+                "sizing_ok": runtime_can_buy,
+                "can_buy": runtime_can_buy,
+                "blocking_reason": runtime_blocking_reason,
                 "final_hold_reason": "",
             })
 
@@ -1727,8 +1755,8 @@ def main():
                     "quote_free": quoteSizing["quote_free"],
                     "min_notional": quoteSizing["min_notional"],
                     "sizing_cap": quoteSizing["sizing_cap"],
-                    "can_buy": quoteSizing["can_buy"],
-                    "blocking_reason": quoteSizing["blocking_reason"],
+                    "can_buy": runtime_can_buy,
+                    "blocking_reason": runtime_blocking_reason,
                     "last_hold_reason": lastHoldReason,
                     "last_entry_gate_trace": lastEntryGateTrace,
                 }
@@ -1817,6 +1845,29 @@ def main():
                     P3,
                     P4,
                     detail=f"order_id={syncState.get('order_id','')} side={syncState.get('order_side','')}",
+                )
+                time.sleep(cfg.idleSleep)
+                continue
+
+            if pos is None and str(syncState.get("status") or "") == "EXTERNAL_HOLDING":
+                maybe_hold(
+                    now,
+                    "HOLD_EXTERNAL_HOLDING",
+                    spread,
+                    momPct,
+                    momRangePct,
+                    upRatio,
+                    bid,
+                    ask,
+                    mid,
+                    P1,
+                    P2,
+                    P3,
+                    P4,
+                    detail=(
+                        f"asset={syncState.get('external_asset','')} "
+                        f"symbol={syncState.get('external_symbol','')}"
+                    ),
                 )
                 time.sleep(cfg.idleSleep)
                 continue
@@ -2802,6 +2853,11 @@ def main():
                     continue
                 _fill_latency_ms = int((time.time() - _order_t0) * 1000)
                 _buy_fee = order_fee_summary(info, fallback_qty=qty, fallback_quote=qty * buyPx)
+                buy_fee_paid = (
+                    float(_buy_fee["fee"])
+                    if _buy_fee["fee_source"] == "exchange"
+                    else None
+                )
                 logCsv({
                     "ts_utc": local_timestamp(),
                     "symbol": symbol,
@@ -2914,6 +2970,13 @@ def main():
                                 **entry_edge_csv_fields(entry_edge),
                             })
                             if topupFilled:
+                                if (
+                                    buy_fee_paid is not None
+                                    and _topup_fee["fee_source"] == "exchange"
+                                ):
+                                    buy_fee_paid += float(_topup_fee["fee"])
+                                else:
+                                    buy_fee_paid = None
                                 topupExecQty = float(topupInfo.get("executedQty", topupQty))
                                 topupQuoteQty = float(topupInfo.get("cummulativeQuoteQty", topupExecQty * topupPx))
                                 execQty += topupExecQty
@@ -3000,6 +3063,12 @@ def main():
                 setattr(pos, "burstTriggerElapsedSec", float(burstStats.get("elapsed_sec", 0.0) or 0.0))
                 setattr(pos, "burstEntryMode", entryMode)
                 setattr(pos, "burstHandoffLogged", False)
+                setattr(pos, "feeBuyPaid", buy_fee_paid)
+                setattr(
+                    pos,
+                    "feeBuySource",
+                    "exchange" if buy_fee_paid is not None else "estimated",
+                )
                 # Persist entry for restart recovery
                 try:
                     _pos_file = runtime_dir / "active_position.json"
@@ -3603,7 +3672,15 @@ def main():
             sell_revenue = quoteQty
             _pnl_detail = _fee_model.compute_net_pnl(
                 float(getattr(pos, 'entry', exitPx)), filledQty,
-                exitPx, filledQty, symbol
+                exitPx,
+                filledQty,
+                symbol,
+                actual_fees_buy=getattr(pos, "feeBuyPaid", None),
+                actual_fees_sell=(
+                    float(_sell_fee["fee"])
+                    if _sell_fee["fee_source"] == "exchange"
+                    else None
+                ),
             )
             pnl = _pnl_detail["net_pnl"]
             pnl_gross = _pnl_detail["gross_pnl"]
