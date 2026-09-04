@@ -838,7 +838,7 @@ def main():
     if ipguard_enabled:
         vpnCheckOrDie(cfg.ipFile, cfg.ipCheckTimeout)
     else:
-        print("IPGUARD_SKIPPED dry_run=1")
+        print(f"IPGUARD_SKIPPED enabled=0 dry_run={int(bool(getattr(cfg, 'dryRun', False)))}")
 
     bx = Kraken(
         cfg.apiKey,
