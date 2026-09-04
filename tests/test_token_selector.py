@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import TokenProfileSelector as selector
+from strategy.pic_filter import PicCheck, should_block_near_peak
 
 
 class FlatTokenHoldTests(unittest.TestCase):
@@ -214,8 +215,15 @@ class RecentHighFilterTests(unittest.TestCase):
                 (105.0 - 104.0) / 105.0,
             )
 
-    def test_pick_best_never_bypasses_recent_high_rejection(self):
-        ranked = [{"symbol": "BTCUSDC", "pct": 0.30, "spread_pct": 0.02, "is_toxic": False}]
+    def test_pick_best_uses_recent_high_candidate_for_observation_only(self):
+        ranked = [{
+            "symbol": "BTCUSDC",
+            "pct": 0.30,
+            "spread_pct": 0.02,
+            "quote_volume_24h": 2_000_000,
+            "trade_count_24h": 6_000,
+            "is_toxic": False,
+        }]
         with (
             patch.object(selector, "collect_candidates", return_value=ranked),
             patch.object(selector, "rank_candidates", return_value=ranked),
@@ -225,7 +233,12 @@ class RecentHighFilterTests(unittest.TestCase):
         ):
             chosen, _ = selector.pick_best_candidate({})
 
-        self.assertIsNone(chosen)
+        self.assertEqual(chosen["symbol"], "BTCUSDC")
+        self.assertTrue(chosen["selector_observe_near_high"])
+        self.assertTrue(should_block_near_peak(
+            "P",
+            PicCheck(True, 0.0, 180, 100.0, "near_peak"),
+        ))
 
 
 if __name__ == "__main__":

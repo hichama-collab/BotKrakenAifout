@@ -20,6 +20,7 @@ TRADE_CSV_FIELDNAMES = [
     "entry_price", "p1", "p2", "p3", "p4", "entry_vs_mid_pct", "mid_vs_entry_pct",
     "notional", "min_notional", "step_size", "tick_size", "ws_age_ms",
     "roundtrip_cost_pct", "signal_edge_pct", "required_edge_pct", "expected_net_edge_pct",
+    "planned_tp_pct", "planned_cost_pct", "planned_net_pct", "entry_edge_basis",
     "entry_cross_spread", "entry_mode", "exit_reason", "exit_reason_raw",
     "session_high_price", "current_price", "session_high_drop_pct",
     "order_id", "client_order_id", "exchange_status", "fill_latency_ms", "cancel_status",

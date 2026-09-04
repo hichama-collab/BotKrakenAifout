@@ -569,6 +569,32 @@ def compute_entry_net_edge(entry_mode: str, signal_edge_pct: float, spread: floa
     }
 
 
+def compute_entry_plan_viability(spread: float, cfg, fee_rate: float | None = None) -> dict:
+    """Check the executable P-entry plan without treating past ticks as future PnL.
+
+    P1..P4 remain an entry-quality confirmation. The common Position TP is
+    the actual trade plan after a fill, so it is the meaningful value to
+    compare with round-trip costs before submitting a P order.
+    """
+    fee = float(fee_rate if fee_rate is not None else getattr(cfg, "defaultFeeRate", 0.001) or 0.001)
+    buffer = float(getattr(cfg, "minProfitBufferPct", 0.0) or 0.0)
+    planned_tp = Position.planned_tp_pct(cfg, fee_rate=fee)
+    planned_cost = compute_roundtrip_cost_pct(spread, fee, buffer)
+    planned_net = planned_tp - planned_cost
+    return {
+        "roundtrip_cost_pct": planned_cost,
+        # Existing CSV fields remain populated; the basis is explicit below.
+        "signal_edge_pct": planned_tp,
+        "required_edge_pct": planned_cost,
+        "expected_net_edge_pct": planned_net,
+        "planned_tp_pct": planned_tp,
+        "planned_cost_pct": planned_cost,
+        "planned_net_pct": planned_net,
+        "plan_viable": planned_net >= 0.0,
+        "entry_edge_basis": "TP_PLAN",
+    }
+
+
 def entry_edge_csv_fields(edge: dict | None) -> dict:
     if not edge:
         return {}
@@ -580,6 +606,11 @@ def entry_edge_csv_fields(edge: dict | None) -> dict:
         out["entry_cross_spread"] = int(bool(edge.get("entry_cross_spread")))
     if "entry_mode" in edge:
         out["entry_mode"] = edge.get("entry_mode") or ""
+    for key in ("planned_tp_pct", "planned_cost_pct", "planned_net_pct"):
+        value = edge.get(key)
+        out[key] = "" if value is None or value == "" else float(value) * 100.0
+    if "entry_edge_basis" in edge:
+        out["entry_edge_basis"] = edge.get("entry_edge_basis") or ""
     return out
 
 
@@ -1666,12 +1697,11 @@ def main():
                     logErr("RANGE_ANALYSIS_FAIL", e)
 
             pTrace = p_tape_snapshot(P1, P2, P3, P4)
-            trace_entry_fee_mult = float(getattr(cfg, "entryFeeEdgeMult", 1.0) or 0.0)
-            trace_fee_edge_pct = (
-                (float(_fee_model.fee_rate) * 2.0)
-                + float(spread)
-                + float(getattr(cfg, "minProfitBufferPct", 0.0) or 0.0)
-            ) * trace_entry_fee_mult * 100.0
+            trace_plan = compute_entry_plan_viability(
+                float(spread),
+                cfg,
+                fee_rate=float(_fee_model.fee_rate),
+            )
             entryGateContext.clear()
             entryGateContext.update({
                 "symbol": symbol,
@@ -1702,8 +1732,10 @@ def main():
                 "entry_min_tape_progress_pct": float(getattr(cfg, "entryMinTapeProgressPct", 0.0) or 0.0) * 100.0,
                 "spread_pct": float(spread) * 100.0,
                 "max_spread_pct": float(spreadLimit) * 100.0,
-                "fee_edge_pct": trace_fee_edge_pct,
-                "tape_vs_fee_ok": pTrace["tape_progress_pct"] >= trace_fee_edge_pct,
+                "planned_tp_pct": trace_plan["planned_tp_pct"] * 100.0,
+                "planned_cost_pct": trace_plan["planned_cost_pct"] * 100.0,
+                "planned_net_pct": trace_plan["planned_net_pct"] * 100.0,
+                "plan_viable": trace_plan["plan_viable"],
                 "near_peak": False,
                 "pic_filter_enabled": bool(getattr(cfg, "picFilter_enabled", False)),
                 "blocked_symbol": symbol in blockedSymbols,
@@ -1947,13 +1979,6 @@ def main():
                 tape_progress_pct = ((float(P1) - float(P4)) / float(P4)) if (has_p_window and float(P4) > 0) else 0.0
                 min_tape_progress_pct = float(getattr(cfg, "entryMinTapeProgressPct", 0.0) or 0.0)
                 min_tape_progress_vs_spread = float(getattr(cfg, "entryMinTapeProgressVsSpread", 0.0) or 0.0)
-                min_profit_buffer_pct = float(getattr(cfg, "minProfitBufferPct", 0.0) or 0.0)
-                entry_fee_edge_mult = float(getattr(cfg, "entryFeeEdgeMult", 1.0) or 0.0)
-                fee_edge_pct = (
-                    (float(_fee_model.fee_rate) * 2.0)
-                    + float(spread)
-                    + min_profit_buffer_pct
-                ) * entry_fee_edge_mult
                 required_tape_progress_pct = max(
                     min_tape_progress_pct,
                     float(spread) * min_tape_progress_vs_spread,
@@ -2254,32 +2279,6 @@ def main():
                         P3,
                         P4,
                         detail=f"hard_min_up_ratio={hard_min_up_ratio*100:.2f}%",
-                    )
-                    time.sleep(cfg.idleSleep)
-                    continue
-
-                if (not burstOverride and not rangeOverride) and fee_edge_pct > 0 and tape_progress_pct < fee_edge_pct:
-                    maybe_hold(
-                        now,
-                        'HOLD_EDGE',
-                        spread,
-                        momPct,
-                        momRangePct,
-                        upRatio,
-                        bid,
-                        ask,
-                        mid,
-                        P1,
-                        P2,
-                        P3,
-                        P4,
-                        detail=(
-                            f"tape_progress={tape_progress_pct*100:.4f}% "
-                            f"fee_edge={fee_edge_pct*100:.4f}% "
-                            f"fees={(float(_fee_model.fee_rate) * 2.0)*100:.4f}% "
-                            f"spread={float(spread)*100:.4f}% "
-                            f"buffer={min_profit_buffer_pct*100:.4f}%"
-                        ),
                     )
                     time.sleep(cfg.idleSleep)
                     continue
@@ -2719,22 +2718,53 @@ def main():
                 if (not cross_spread) and auto_cross_spread_pct > 0 and float(spread) <= auto_cross_spread_pct:
                     cross_spread = True
 
-                if burstOverride:
+                if entryMode == "P":
+                    entry_edge = compute_entry_plan_viability(
+                        float(spread),
+                        cfg,
+                        fee_rate=float(_fee_model.fee_rate),
+                    )
+                elif burstOverride:
                     entry_signal_edge_pct = float(burstStats.get("return_pct", 0.0) or 0.0)
+                    entry_edge = compute_entry_net_edge(
+                        entryMode,
+                        entry_signal_edge_pct,
+                        float(spread),
+                        cfg,
+                        fee_rate=float(_fee_model.fee_rate),
+                    )
                 elif rangeOverride:
                     entry_signal_edge_pct = max(float(range_rebound or 0.0), float(tape_progress_pct or 0.0))
+                    entry_edge = compute_entry_net_edge(
+                        entryMode,
+                        entry_signal_edge_pct,
+                        float(spread),
+                        cfg,
+                        fee_rate=float(_fee_model.fee_rate),
+                    )
                 else:
                     entry_signal_edge_pct = float(tape_progress_pct or 0.0)
-                entry_edge = compute_entry_net_edge(
-                    entryMode,
-                    entry_signal_edge_pct,
-                    float(spread),
-                    cfg,
-                    fee_rate=float(_fee_model.fee_rate),
-                )
                 entry_edge["entry_mode"] = entryMode
                 entry_edge["entry_cross_spread"] = int(bool(cross_spread))
-                if entry_edge["signal_edge_pct"] < entry_edge["required_edge_pct"]:
+                entry_plan_viable = bool(entry_edge.get("plan_viable", False)) if entryMode == "P" else (
+                    entry_edge["signal_edge_pct"] >= entry_edge["required_edge_pct"]
+                )
+                if not entry_plan_viable:
+                    if entryMode == "P":
+                        entry_detail = (
+                            f"mode={entryMode} planned_tp={entry_edge['planned_tp_pct']*100:.4f}% "
+                            f"planned_cost={entry_edge['planned_cost_pct']*100:.4f}% "
+                            f"planned_net={entry_edge['planned_net_pct']*100:.4f}% "
+                            f"cross={int(bool(cross_spread))}"
+                        )
+                    else:
+                        entry_detail = (
+                            f"mode={entryMode} signal_edge={entry_edge['signal_edge_pct']*100:.4f}% "
+                            f"required={entry_edge['required_edge_pct']*100:.4f}% "
+                            f"roundtrip_cost={entry_edge['roundtrip_cost_pct']*100:.4f}% "
+                            f"expected_net={entry_edge['expected_net_edge_pct']*100:.4f}% "
+                            f"cross={int(bool(cross_spread))}"
+                        )
                     maybe_hold(
                         now,
                         "HOLD_NET_EDGE",
@@ -2749,13 +2779,7 @@ def main():
                         P2,
                         P3,
                         P4,
-                        detail=(
-                            f"mode={entryMode} signal_edge={entry_edge['signal_edge_pct']*100:.4f}% "
-                            f"required={entry_edge['required_edge_pct']*100:.4f}% "
-                            f"roundtrip_cost={entry_edge['roundtrip_cost_pct']*100:.4f}% "
-                            f"expected_net={entry_edge['expected_net_edge_pct']*100:.4f}% "
-                            f"cross={int(bool(cross_spread))}"
-                        ),
+                        detail=entry_detail,
                         entry_edge=entry_edge,
                     )
                     time.sleep(cfg.idleSleep)

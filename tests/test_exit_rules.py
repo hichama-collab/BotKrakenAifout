@@ -7,6 +7,7 @@ from main import (
     burst_entry_signal,
     burst_runtime_allowed,
     buy_below_sellable_notional,
+    compute_entry_plan_viability,
     compute_entry_net_edge,
     loss_exit_allowed,
     strict_p_tape_exit_reason,
@@ -125,6 +126,24 @@ def test_entry_net_edge_accepts_signal_above_required_cost():
 
     assert edge["signal_edge_pct"] >= edge["required_edge_pct"]
     assert edge["expected_net_edge_pct"] == pytest.approx(0.0010)
+
+
+def test_p_entry_plan_is_viable_with_real_kraken_fee_without_one_percent_tape():
+    cfg = SimpleNamespace(
+        riskPct=0.0065,
+        tpPct=0.008,
+        tpMinPct=0.004,
+        defaultFeeRate=0.0035,
+        minProfitBufferPct=0.001,
+        tpNetMarginPct=0.003,
+    )
+
+    plan = compute_entry_plan_viability(0.0008, cfg, fee_rate=0.0035)
+
+    assert plan["planned_tp_pct"] == pytest.approx(0.011)
+    assert plan["planned_cost_pct"] == pytest.approx(0.0088)
+    assert plan["planned_net_pct"] == pytest.approx(0.0022)
+    assert plan["plan_viable"] is True
 
 
 def test_burst_signal_uses_burst_net_edge_multiplier():

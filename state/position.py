@@ -62,21 +62,31 @@ class Position:
         if candidate > self.stop:
             self.stop = candidate
 
+    @staticmethod
+    def planned_tp_pct(cfg, fee_rate: float | None = None) -> float:
+        """Return the TP percentage that ``init_stops`` will apply after a fill."""
+        sl_pct = float(getattr(cfg, "riskPct", 0.008))
+        if sl_pct <= 0:
+            sl_pct = 0.008
+        tp_pct = float(getattr(cfg, "tpPct", max(0.006, sl_pct * 3.0)))
+        tp_min_pct = float(getattr(cfg, "tpMinPct", 0.0) or 0.0)
+        if tp_min_pct > 0:
+            tp_pct = max(tp_pct, tp_min_pct)
+        resolved_fee_rate = float(
+            fee_rate if fee_rate is not None else getattr(cfg, "defaultFeeRate", 0.001) or 0.001
+        )
+        min_profit_buffer = float(getattr(cfg, "minProfitBufferPct", 0.0) or 0.0)
+        tp_net_margin = float(getattr(cfg, "tpNetMarginPct", 0.003) or 0.003)
+        return max(tp_pct, (2.0 * resolved_fee_rate) + min_profit_buffer + tp_net_margin)
+
     def init_stops(self, cfg, profile, tick: float):
         # SL uses cfg.riskPct by default; fallback = 0.8%
         sl_pct = float(getattr(cfg, "riskPct", 0.008))
         if sl_pct <= 0:
             sl_pct = 0.008
 
-        # TP default derived from riskPct, but not too small.
-        tp_pct = float(getattr(cfg, "tpPct", max(0.006, sl_pct * 3.0)))
-        tp_min_pct = float(getattr(cfg, "tpMinPct", 0.0) or 0.0)
-        if tp_min_pct > 0:
-            tp_pct = max(tp_pct, tp_min_pct)
-        fee_rate = float(getattr(cfg, "defaultFeeRate", 0.001) or 0.001)
-        min_profit_buffer = float(getattr(cfg, "minProfitBufferPct", 0.0) or 0.0)
-        tp_net_margin = float(getattr(cfg, "tpNetMarginPct", 0.003) or 0.003)
-        tp_pct = max(tp_pct, (2.0 * fee_rate) + min_profit_buffer + tp_net_margin)
+        # Reuse the same planned TP exposed to the entry viability check.
+        tp_pct = self.planned_tp_pct(cfg)
         arm_pct = float(getattr(cfg, "armPct", max(0.0045, sl_pct * 1.5)))
         fee_buf = float(getattr(cfg, "feeBufPct", 0.0025))
         trail_pct = float(getattr(cfg, "trailPct", 0.004))

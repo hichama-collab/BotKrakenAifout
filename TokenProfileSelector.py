@@ -657,6 +657,7 @@ def pick_best_candidate(score_map, excluded_symbols: set[str] | None = None, qua
     # Choose best candidate whose current 2-min direction is acceptable (not in free fall)
     chosen = None
     near_high_rejected: set[str] = set()
+    observation_candidate = None
     for item in ranked:
         if item.get("is_toxic"):
             continue
@@ -670,16 +671,22 @@ def pick_best_candidate(score_map, excluded_symbols: set[str] | None = None, qua
         if dist is not None and dist < SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT:
             near_high_rejected.add(item["symbol"])
             print(
-                f"TOKEN_SELECTOR: skip {item['symbol']} near_5m_high "
+                f"TOKEN_SELECTOR: observe_only {item['symbol']} near_5m_high "
                 f"dist={dist*100:.3f}% < {SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT*100:.3f}%"
             )
+            if observation_candidate is None:
+                observation_candidate = {**item, "selector_observe_near_high": True}
             continue
         chosen = item
         break
     if chosen is None:
         # A noisy direction check may be bypassed, but the recent-high
-        # anti-chase filter is never bypassed.
+        # anti-chase filter is never bypassed for an entry decision. A market
+        # that only failed this selector-side condition is still worth
+        # observing: main.py applies the final pic filter before every BUY.
         chosen = next((item for item in ranked if not item["is_toxic"] and item["symbol"] not in near_high_rejected), None)
+    if chosen is None and observation_candidate is not None:
+        chosen = observation_candidate
     return chosen, ranked
 
 
@@ -945,7 +952,7 @@ def main():
             "last_switch_symbol": chosen["symbol"],
         })
     _log_selector_selected_reason(
-        "BEST_ELIGIBLE_CANDIDATE",
+        "OBSERVE_NEAR_5M_HIGH" if chosen.get("selector_observe_near_high") else "BEST_ELIGIBLE_CANDIDATE",
         symbol=chosen["symbol"],
         current=current_symbol or "-",
     )
