@@ -58,7 +58,7 @@ profiles:
     entry_min_strict_ups: 2
     entry_min_tape_progress_pct: 0.00025
     entry_min_tape_progress_vs_spread: 1.0
-    entry_fee_edge_mult: 1.25
+    entry_fee_edge_mult: 0.0
     entry_min_net_edge_mult: 1.20
     min_profit_buffer_pct: 0.0010
     flow_defense_enabled: false

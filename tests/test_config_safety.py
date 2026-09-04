@@ -42,5 +42,6 @@ def test_strict_and_aggressive_load_distinct_live_profiles():
     assert aggressive.burstEntryEnabled is False
     assert strict.picFilter_enabled is True
     assert aggressive.picFilter_enabled is True
+    assert strict.entryFeeEdgeMult == 0.0
     assert strict.entryMinNetEdgeMult != aggressive.entryMinNetEdgeMult
     assert strict.maxConsecutiveLosses != aggressive.maxConsecutiveLosses
