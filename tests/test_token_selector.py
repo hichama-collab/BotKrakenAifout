@@ -43,6 +43,30 @@ class CandidateWindowTests(unittest.TestCase):
                 1.0,
             )
 
+    def test_change_window_ignores_future_kraken_placeholder_candle(self):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "error": [],
+                    "result": {
+                        "BTCUSDC": [
+                            [60, "100", "101", "99", "100", "0"],
+                            [120, "100", "103", "99", "102", "0"],
+                            [180, "102", "102", "102", "102", "0"],
+                        ],
+                        "last": 120,
+                    },
+                }
+
+        with (
+            patch.object(selector, "_PAIR_META", {"BTCUSDC": {"pair_id": "BTCUSDC"}}),
+            patch.object(selector._SESSION, "get", return_value=Response()),
+        ):
+            self.assertAlmostEqual(selector.change_window_pct("BTCUSDC", minutes=2), 2.0)
+
     def test_rejects_micro_move(self):
         with (
             patch.object(selector, "SELECTOR_MIN_WINDOW_PCT", 0.15),
@@ -222,7 +246,7 @@ class RecentHighFilterTests(unittest.TestCase):
                 (105.0 - 104.0) / 105.0,
             )
 
-    def test_pick_best_rejects_candidate_too_close_to_high(self):
+    def test_pick_best_uses_top_candidate_after_all_recent_high_rejections(self):
         ranked = [{"symbol": "BTCUSDC", "pct": 0.30, "spread_pct": 0.02, "is_toxic": False}]
         with (
             patch.object(selector, "collect_candidates", return_value=ranked),
@@ -230,10 +254,12 @@ class RecentHighFilterTests(unittest.TestCase):
             patch.object(selector, "current_direction_pct", return_value=0.10),
             patch.object(selector, "distance_from_recent_high_pct", return_value=0.0001),
             patch.object(selector, "SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT", 0.0020),
+            patch.object(selector, "SELECTOR_FALLBACK_ON_RECENT_HIGH", True),
         ):
             chosen, _ = selector.pick_best_candidate({})
 
-        self.assertIsNone(chosen)
+        self.assertEqual(chosen["symbol"], "BTCUSDC")
+        self.assertEqual(chosen["selection_mode"], "RECENT_HIGH_FALLBACK")
 
 
 if __name__ == "__main__":

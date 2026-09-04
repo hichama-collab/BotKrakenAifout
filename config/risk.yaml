@@ -594,6 +594,31 @@ tokenQuality:
   respectBlocked: true         # si false, les bloqués sont pénalisés mais pas exclus
   rebuildOnStart: true         # rebuild token_quality.json au démarrage du selector
 
+# ── Token Profile Selector (Kraken Spot, sélection uniquement) ──────────────
+# Ces seuils sélectionnent l'univers à observer. Ils ne modifient ni les
+# stratégies d'entrée, ni les sorties, ni le sizing.
+tokenProfileSelector:
+  window_minutes: 2
+  min_hold_minutes: 10
+  flat_min_hold_minutes: 5
+  hysteresis_pct: 0.25
+  min_active_var_pct: 0.15
+  min_direction_pct: -0.15
+  max_spread_pct: 0.0025
+  min_price_usdc: 0.05
+  min_quote_volume_usdc_24h: 250000
+  min_trade_count_24h: 1000
+  min_window_pct: 0.15
+  max_window_pct: 1.80
+  max_window_pct_unknown: 1.20
+  min_move_to_spread: 2.0
+  min_24h_change_pct: -8.0
+  max_24h_change_pct: 12.0
+  unknown_score_penalty: 0.05
+  runtime_lock_max_age_sec: 300
+  max_distance_from_5m_high_pct: 0.0020
+  fallback_on_recent_high: true
+
 # ── Pic Filter ────────────────────────────────────────────────────────────────
 picFilter:
   enabled: true

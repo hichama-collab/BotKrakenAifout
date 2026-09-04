@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
+import yaml
 
 from core.trade_memory import load_token_scores, sync_trade_memory
 from state.token_quality import load_quality_map, save_quality_map
@@ -20,33 +21,51 @@ BLOCKED_SYMBOLS_PATH = Path(
 SELECTOR_STATE_PATH = ROOT_PATH / "data" / "runtime" / "selector_state.json"
 RUNTIME_POSITION_PATH = ROOT_PATH / "data" / "runtime" / "position.json"
 RUNTIME_PORTFOLIO_PATH = ROOT_PATH / "data" / "runtime" / "portfolio.json"
-# Durée minimale sur un token avant de switcher (en minutes)
-SELECTOR_MIN_HOLD_MINUTES = float(os.getenv("SELECTOR_MIN_HOLD_MINUTES", "10"))
-# Garde absolue : aucun switch avant ce délai, même avec un meilleur score.
-SELECTOR_FLAT_MIN_HOLD_MINUTES = float(os.getenv("SELECTOR_FLAT_MIN_HOLD_MINUTES", "5"))
-# Amélioration minimale du score pour justifier un switch pendant la période de garde
-SELECTOR_HYSTERESIS_PCT = float(os.getenv("SELECTOR_HYSTERESIS_PCT", "0.25"))
-# Variation minimale sous laquelle le token actuel est considéré comme plat.
-SELECTOR_MIN_ACTIVE_VAR_PCT = float(os.getenv("SELECTOR_MIN_ACTIVE_VAR_PCT", "0.15"))
-# Direction 1-2min minimum pour valider le candidat choisi (évite d'entrer après le move)
-SELECTOR_MIN_DIRECTION_PCT = float(os.getenv("SELECTOR_MIN_DIRECTION_PCT", "-0.15"))
-WINDOW_MINUTES = max(2, int(os.getenv("SELECTOR_WINDOW_MINUTES", "2")))
+def _load_selector_settings() -> dict:
+    try:
+        with (ROOT_PATH / "config" / "risk.yaml").open(encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        settings = data.get("tokenProfileSelector") or {}
+        return settings if isinstance(settings, dict) else {}
+    except Exception:
+        return {}
+
+
+_SELECTOR_SETTINGS = _load_selector_settings()
+
+
+def _selector_setting(name: str, env_name: str, default, cast):
+    raw = os.getenv(env_name)
+    if raw not in (None, ""):
+        return cast(raw)
+    return cast(_SELECTOR_SETTINGS.get(name, default))
+
+
+# Selector thresholds live in config/risk.yaml. Environment overrides remain
+# available for service-level emergency overrides without changing trading logic.
+SELECTOR_MIN_HOLD_MINUTES = _selector_setting("min_hold_minutes", "SELECTOR_MIN_HOLD_MINUTES", 10, float)
+SELECTOR_FLAT_MIN_HOLD_MINUTES = _selector_setting("flat_min_hold_minutes", "SELECTOR_FLAT_MIN_HOLD_MINUTES", 5, float)
+SELECTOR_HYSTERESIS_PCT = _selector_setting("hysteresis_pct", "SELECTOR_HYSTERESIS_PCT", 0.25, float)
+SELECTOR_MIN_ACTIVE_VAR_PCT = _selector_setting("min_active_var_pct", "SELECTOR_MIN_ACTIVE_VAR_PCT", 0.15, float)
+SELECTOR_MIN_DIRECTION_PCT = _selector_setting("min_direction_pct", "SELECTOR_MIN_DIRECTION_PCT", -0.15, float)
+WINDOW_MINUTES = max(2, _selector_setting("window_minutes", "SELECTOR_WINDOW_MINUTES", 2, int))
 HTTP_TIMEOUT = 5
 MAX_WORKERS = 16
-SELECTOR_MAX_SPREAD_PCT = float(os.getenv("SELECTOR_MAX_SPREAD_PCT", "0.0025"))
-SELECTOR_MIN_PRICE_USDC = float(os.getenv("SELECTOR_MIN_PRICE_USDC", "0.05"))
-SELECTOR_MIN_QUOTE_VOLUME_USDC_24H = float(os.getenv("SELECTOR_MIN_QUOTE_VOLUME_USDC_24H", "1000000"))
-SELECTOR_MIN_TRADE_COUNT_24H = int(os.getenv("SELECTOR_MIN_TRADE_COUNT_24H", "5000"))
-SELECTOR_MIN_WINDOW_PCT = float(os.getenv("SELECTOR_MIN_WINDOW_PCT", "0.15"))
-SELECTOR_MAX_WINDOW_PCT = float(os.getenv("SELECTOR_MAX_WINDOW_PCT", "1.80"))
-SELECTOR_MAX_WINDOW_PCT_UNKNOWN = float(os.getenv("SELECTOR_MAX_WINDOW_PCT_UNKNOWN", "1.20"))
-SELECTOR_MIN_MOVE_TO_SPREAD = float(os.getenv("SELECTOR_MIN_MOVE_TO_SPREAD", "2.0"))
-SELECTOR_MIN_24H_CHANGE_PCT = float(os.getenv("SELECTOR_MIN_24H_CHANGE_PCT", "-8.0"))
-SELECTOR_MAX_24H_CHANGE_PCT = float(os.getenv("SELECTOR_MAX_24H_CHANGE_PCT", "12.0"))
-SELECTOR_UNKNOWN_SCORE_PENALTY = float(os.getenv("SELECTOR_UNKNOWN_SCORE_PENALTY", "0.05"))
+SELECTOR_MAX_SPREAD_PCT = _selector_setting("max_spread_pct", "SELECTOR_MAX_SPREAD_PCT", 0.0025, float)
+SELECTOR_MIN_PRICE_USDC = _selector_setting("min_price_usdc", "SELECTOR_MIN_PRICE_USDC", 0.05, float)
+SELECTOR_MIN_QUOTE_VOLUME_USDC_24H = _selector_setting("min_quote_volume_usdc_24h", "SELECTOR_MIN_QUOTE_VOLUME_USDC_24H", 250000, float)
+SELECTOR_MIN_TRADE_COUNT_24H = _selector_setting("min_trade_count_24h", "SELECTOR_MIN_TRADE_COUNT_24H", 1000, int)
+SELECTOR_MIN_WINDOW_PCT = _selector_setting("min_window_pct", "SELECTOR_MIN_WINDOW_PCT", 0.15, float)
+SELECTOR_MAX_WINDOW_PCT = _selector_setting("max_window_pct", "SELECTOR_MAX_WINDOW_PCT", 1.80, float)
+SELECTOR_MAX_WINDOW_PCT_UNKNOWN = _selector_setting("max_window_pct_unknown", "SELECTOR_MAX_WINDOW_PCT_UNKNOWN", 1.20, float)
+SELECTOR_MIN_MOVE_TO_SPREAD = _selector_setting("min_move_to_spread", "SELECTOR_MIN_MOVE_TO_SPREAD", 2.0, float)
+SELECTOR_MIN_24H_CHANGE_PCT = _selector_setting("min_24h_change_pct", "SELECTOR_MIN_24H_CHANGE_PCT", -8.0, float)
+SELECTOR_MAX_24H_CHANGE_PCT = _selector_setting("max_24h_change_pct", "SELECTOR_MAX_24H_CHANGE_PCT", 12.0, float)
+SELECTOR_UNKNOWN_SCORE_PENALTY = _selector_setting("unknown_score_penalty", "SELECTOR_UNKNOWN_SCORE_PENALTY", 0.05, float)
 SELECTOR_RESPECT_WALLET_POSITION = os.getenv("SELECTOR_RESPECT_WALLET_POSITION", "1") != "0"
-SELECTOR_RUNTIME_LOCK_MAX_AGE_SEC = float(os.getenv("SELECTOR_RUNTIME_LOCK_MAX_AGE_SEC", "300"))
-SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT = float(os.getenv("SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT", "0.0020"))
+SELECTOR_RUNTIME_LOCK_MAX_AGE_SEC = _selector_setting("runtime_lock_max_age_sec", "SELECTOR_RUNTIME_LOCK_MAX_AGE_SEC", 300, float)
+SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT = _selector_setting("max_distance_from_5m_high_pct", "SELECTOR_MAX_DISTANCE_FROM_5M_HIGH_PCT", 0.0020, float)
+SELECTOR_FALLBACK_ON_RECENT_HIGH = _selector_setting("fallback_on_recent_high", "SELECTOR_FALLBACK_ON_RECENT_HIGH", True, lambda value: str(value).lower() not in {"0", "false", "no"})
 # A raw top-mover fallback previously bypassed the tradability gates below and
 # restarted the bot every two minutes on negligible moves. Keep it opt-in only.
 SELECTOR_TOP_MOVER_FALLBACK = os.getenv("SELECTOR_TOP_MOVER_FALLBACK", "0") != "0"
@@ -75,6 +94,7 @@ def _save_selector_state(state: dict) -> None:
 def _record_selector_decision(reason: str, **fields) -> None:
     """Persist the last selector verdict for dashboard and offline audit."""
     state = _load_selector_state()
+    state.pop("current", None)
     state.update({
         "updated_at": time.time(),
         "last_reason": str(reason),
@@ -414,16 +434,31 @@ def _log_selector_selected_reason(reason: str, **fields) -> None:
     detail = " ".join(f"{key}={value}" for key, value in fields.items())
     print(f"TOKEN_SELECTOR_SELECTED_REASON reason={reason} {detail}".rstrip())
 
-def change_window_pct(symbol: str, minutes: int = WINDOW_MINUTES):
-    # klines-based price change over `minutes` 1m candles
-    limit = max(2, minutes)
+def _recent_ohlc_bars(symbol: str) -> list:
     pair = (_PAIR_META.get(symbol) or {}).get("pair_id", symbol.replace("BTC", "XBT", 1))
     r = _SESSION.get(f"{BASE_URL}/0/public/OHLC", params={"pair": pair, "interval": 1}, timeout=HTTP_TIMEOUT)
     data = _kraken_result(r)
     if isinstance(data, list):
-        k = data
-    else:
-        k = (data or {}).get(pair) or next((v for k, v in (data or {}).items() if k != "last"), [])
+        return data
+
+    payload = data or {}
+    bars = payload.get(pair) or next((value for key, value in payload.items() if key != "last"), [])
+    if not isinstance(bars, list):
+        return []
+    try:
+        last_timestamp = int(float(payload.get("last")))
+    except (TypeError, ValueError):
+        return bars
+
+    # Kraken may append an empty next-minute candle after `last`. It is not a
+    # market update and made the former `k[-2:]` calculation read two flat bars.
+    return [bar for bar in bars if isinstance(bar, (list, tuple)) and bar and int(float(bar[0])) <= last_timestamp]
+
+
+def change_window_pct(symbol: str, minutes: int = WINDOW_MINUTES):
+    # 1m OHLC change over the requested completed/current Kraken window.
+    limit = max(2, minutes)
+    k = _recent_ohlc_bars(symbol)
     if not isinstance(k, list) or len(k) < limit:
         return None
     window = k[-limit:]
@@ -445,13 +480,7 @@ def current_direction_pct(symbol: str) -> float | None:
 def distance_from_recent_high_pct(symbol: str, minutes: int = 5) -> float | None:
     try:
         limit = max(2, int(minutes))
-        pair = (_PAIR_META.get(symbol) or {}).get("pair_id", symbol.replace("BTC", "XBT", 1))
-        r = _SESSION.get(f"{BASE_URL}/0/public/OHLC", params={"pair": pair, "interval": 1}, timeout=HTTP_TIMEOUT)
-        data = _kraken_result(r)
-        if isinstance(data, list):
-            k = data
-        else:
-            k = (data or {}).get(pair) or next((v for k, v in (data or {}).items() if k != "last"), [])
+        k = _recent_ohlc_bars(symbol)
         if not isinstance(k, list) or len(k) < 2:
             return None
         window = k[-limit:]
@@ -639,8 +668,20 @@ def pick_best_candidate(score_map, excluded_symbols: set[str] | None = None, qua
         chosen = item
         break
     if chosen is None:
-        # Fallback may bypass a noisy direction check, but never the high-chase filter.
-        chosen = next((item for item in ranked if not item["is_toxic"] and item["symbol"] not in near_high_rejected), None)
+        # Preserve Binance's preference for a non-chasing move. On Kraken's
+        # smaller USDC universe, however, keeping a stale symbol forever is
+        # worse than selecting the best liquid mover and letting entry gates
+        # decide whether it is actionable.
+        fallback = next((item for item in ranked if not item["is_toxic"] and item["symbol"] not in near_high_rejected), None)
+        if fallback is None and SELECTOR_FALLBACK_ON_RECENT_HIGH:
+            fallback = next((item for item in ranked if not item["is_toxic"]), None)
+            if fallback is not None:
+                fallback = {**fallback, "selection_mode": "RECENT_HIGH_FALLBACK"}
+                print(
+                    f"TOKEN_SELECTOR: selecting {fallback['symbol']} after recent-high filter "
+                    f"var={fallback['pct']:.2f}%"
+                )
+        chosen = fallback
     return chosen, ranked
 
 
