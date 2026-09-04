@@ -18,6 +18,7 @@ class Stream:
         self.bestBid = 0.0
         self.bestAsk = 0.0
         self.lastUpdate = 0.0
+        self.lastTransportUpdate = 0.0
         self.tickSeq = 0
         self.url = str(getattr(cfg, "wsUrl", "wss://ws.kraken.com/v2") or "wss://ws.kraken.com/v2")
         self.channel = str(getattr(cfg, "wsChannel", "ticker") or "ticker").strip().lower()
@@ -84,9 +85,15 @@ class Stream:
         }
         ws.send(json.dumps(payload))
         with self._lock:
-            self._wsConnectedAt = time.time()
+            now = time.time()
+            self._wsConnectedAt = now
+            self.lastTransportUpdate = now
             self._last_stale_reconnect = 0.0
         self._log(f"WS_SUBSCRIBED channel={self.channel} symbol={self._ws_symbol()}")
+
+    def _mark_transport_alive(self) -> None:
+        with self._lock:
+            self.lastTransportUpdate = time.time()
 
     def _accept_bid_ask(self, bid: float, ask: float) -> None:
         if bid <= 0 or ask <= 0 or bid >= ask:
@@ -144,6 +151,10 @@ class Stream:
             data = json.loads(msg)
             if not isinstance(data, dict):
                 return
+            # Kraken sends heartbeat and subscription frames even when the best
+            # bid/ask is unchanged. They prove the transport is healthy but are
+            # deliberately not market ticks.
+            self._mark_transport_alive()
             if data.get("channel") == "book":
                 self._handle_book_message(data)
                 return
@@ -218,9 +229,11 @@ class Stream:
 
     def _request_stale_reconnect(self, now: float, stale_sec: float) -> None:
         with self._lock:
-            if self.lastUpdate <= 0 and (
+            if self.lastTransportUpdate <= 0 and (
                 self._wsConnectedAt <= 0 or now - self._wsConnectedAt < stale_sec
             ):
+                return
+            if self.lastTransportUpdate > 0 and now - self.lastTransportUpdate <= stale_sec:
                 return
             if now - self._last_stale_reconnect < max(stale_sec, 1.0):
                 return
@@ -254,6 +267,7 @@ class Stream:
             self.bestBid = bid
             self.bestAsk = ask
             self.lastUpdate = now
+            self.lastTransportUpdate = now
             self.tickSeq += 1
             seq = self.tickSeq
         return bid, ask, now, seq
@@ -265,7 +279,8 @@ class Stream:
             b = self.bestBid
             a = self.bestAsk
             lu = self.lastUpdate
-        if b <= 0 or a <= 0 or lu <= 0 or (now - lu) > stale_sec:
+            transport_lu = self.lastTransportUpdate
+        if b <= 0 or a <= 0 or lu <= 0 or (now - transport_lu) > stale_sec:
             self._request_stale_reconnect(now, stale_sec)
             fb, fa, _fl, _fs = self._rest_fallback()
             if fb > 0 and fa > 0:
@@ -280,8 +295,9 @@ class Stream:
             b = self.bestBid
             a = self.bestAsk
             lu = self.lastUpdate
+            transport_lu = self.lastTransportUpdate
             seq = self.tickSeq
-        if b <= 0 or a <= 0 or lu <= 0 or (now - lu) > stale_sec:
+        if b <= 0 or a <= 0 or lu <= 0 or (now - transport_lu) > stale_sec:
             self._request_stale_reconnect(now, stale_sec)
             fb, fa, flu, fseq = self._rest_fallback()
             if fb > 0 and fa > 0:

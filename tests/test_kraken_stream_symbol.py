@@ -68,9 +68,33 @@ def test_stale_stream_requests_reconnect_without_using_live_rest_fallback():
     stream.bestBid = 100.0
     stream.bestAsk = 101.0
     stream.lastUpdate = 1.0
+    stream.lastTransportUpdate = 1.0
 
     assert stream.snapshot() == (0.0, 0.0, 0.0, 0)
     assert fake_socket.closed is True
+
+
+def test_heartbeat_keeps_unchanged_bbo_usable_without_creating_a_tick():
+    class FakeSocket:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    stream = Stream(SimpleNamespace(wsUrl="wss://example.invalid", dryRun=False, wsStaleSec=0.01), "BTCUSDC", mapper=FakeMapper())
+    fake_socket = FakeSocket()
+    stream._ws = fake_socket
+    stream.bestBid = 100.0
+    stream.bestAsk = 101.0
+    stream.lastUpdate = 1.0
+    stream.tickSeq = 7
+
+    stream.on_message(None, json.dumps({"channel": "heartbeat"}))
+
+    bid, ask, tick_ts, tick_seq = stream.snapshot()
+    assert (bid, ask, tick_ts, tick_seq) == (100.0, 101.0, 1.0, 7)
+    assert fake_socket.closed is False
 
 
 def test_stream_book_snapshot_and_update_keep_best_bid_ask():
