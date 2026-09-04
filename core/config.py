@@ -98,6 +98,7 @@ class Config:
     wsChannel: str = "ticker"
     wsBookDepth: int = 10
     wsTickerEventTrigger: str = "bbo"
+    wsTransportStaleSec: float = 30.0
     krakenEnv: str = "spot"
     quoteAsset: str = "USDC"
 
@@ -345,6 +346,12 @@ def loadConfig() -> Config:
     ws_ticker_event_trigger = os.getenv("KRAKEN_WS_TICKER_EVENT_TRIGGER", "bbo").strip().lower() or "bbo"
     if ws_ticker_event_trigger not in {"bbo", "trades"}:
         ws_ticker_event_trigger = "bbo"
+    try:
+        ws_transport_stale_sec = float(os.getenv("KRAKEN_WS_TRANSPORT_STALE_SEC", "30") or "30")
+    except ValueError:
+        ws_transport_stale_sec = 30.0
+    if ws_transport_stale_sec <= 0:
+        ws_transport_stale_sec = 30.0
     kraken_env = os.getenv("KRAKEN_ENV", "spot").strip().lower() or "spot"
     quote_asset = os.getenv("QUOTE_ASSET", "USDC").strip().upper() or "USDC"
     if not dry and (not apiKey or not apiSecret):
@@ -361,6 +368,7 @@ def loadConfig() -> Config:
         wsChannel=ws_channel,
         wsBookDepth=ws_book_depth,
         wsTickerEventTrigger=ws_ticker_event_trigger,
+        wsTransportStaleSec=ws_transport_stale_sec,
         krakenEnv=kraken_env,
         quoteAsset=quote_asset,
         dryRun=dry,

@@ -71,6 +71,7 @@ class Stream:
             on_message=self.on_message,
             on_error=self.on_error,
             on_close=self.on_close,
+            on_pong=self.on_pong,
         )
 
     def on_open(self, ws):
@@ -176,6 +177,9 @@ class Stream:
     def on_error(self, ws, err):
         self._log(f"WS_ERROR type={type(err).__name__}")
 
+    def on_pong(self, ws, message):
+        self._mark_transport_alive()
+
     def on_close(self, ws, *args):
         self._log("WS_CLOSED")
 
@@ -273,7 +277,7 @@ class Stream:
         return bid, ask, now, seq
 
     def bestBidAsk(self):
-        stale_sec = float(getattr(self.cfg, "wsStaleSec", 3.0))
+        stale_sec = float(getattr(self.cfg, "wsTransportStaleSec", 30.0))
         now = time.time()
         with self._lock:
             b = self.bestBid
@@ -289,7 +293,7 @@ class Stream:
         return b, a
 
     def snapshot(self):
-        stale_sec = float(getattr(self.cfg, "wsStaleSec", 3.0))
+        stale_sec = float(getattr(self.cfg, "wsTransportStaleSec", 30.0))
         now = time.time()
         with self._lock:
             b = self.bestBid

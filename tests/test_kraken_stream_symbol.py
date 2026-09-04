@@ -62,7 +62,7 @@ def test_stale_stream_requests_reconnect_without_using_live_rest_fallback():
         def close(self):
             self.closed = True
 
-    stream = Stream(SimpleNamespace(wsUrl="wss://example.invalid", dryRun=False, wsStaleSec=0.01), "BTCUSDC", mapper=FakeMapper())
+    stream = Stream(SimpleNamespace(wsUrl="wss://example.invalid", dryRun=False, wsTransportStaleSec=0.01), "BTCUSDC", mapper=FakeMapper())
     fake_socket = FakeSocket()
     stream._ws = fake_socket
     stream.bestBid = 100.0
@@ -82,7 +82,7 @@ def test_heartbeat_keeps_unchanged_bbo_usable_without_creating_a_tick():
         def close(self):
             self.closed = True
 
-    stream = Stream(SimpleNamespace(wsUrl="wss://example.invalid", dryRun=False, wsStaleSec=0.01), "BTCUSDC", mapper=FakeMapper())
+    stream = Stream(SimpleNamespace(wsUrl="wss://example.invalid", dryRun=False, wsTransportStaleSec=0.01), "BTCUSDC", mapper=FakeMapper())
     fake_socket = FakeSocket()
     stream._ws = fake_socket
     stream.bestBid = 100.0
