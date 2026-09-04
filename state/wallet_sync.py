@@ -42,12 +42,11 @@ def _wallet_holdings(
     min_notional: float,
     quote_asset: str,
 ) -> list:
-    """Keep externally held assets visible even when no direct quote pair exists.
+    """Keep manually held assets visible without treating them as bot positions.
 
-    A missing ``ASSET/QUOTE`` ticker is not evidence of dust.  In particular,
-    Kraken can hold an asset through a USD or EUR manual order while the bot is
-    configured for USDC.  Such a holding must remain visible and block a new
-    automated entry rather than silently disappearing from portfolio state.
+    A Kraken account may contain manual USD/EUR activity while this bot owns a
+    distinct USDC spot scope.  Those assets remain visible in portfolio state,
+    but only the active bot base asset can represent an unknown bot position.
     """
     holdings = []
     quote = str(quote_asset or "USDC").upper()
@@ -350,28 +349,26 @@ def walletSyncEvery(
     holdings = _wallet_holdings(balances, bid_map, float(minNotional), quote_asset)
     external_holding = next((h for h in holdings if h.get("asset") != base), None)
 
-    # A manual holding on another Kraken pair is not a bot position.  Do not
-    # adopt it, infer an entry, or rewrite SYMBOL.  Keeping the bot flat and
-    # blocking fresh entries is the only safe one-position behaviour.
+    # Manual holdings outside the active base asset are not bot positions.
+    # Keep them observable, but do not adopt, trade, cancel, or let them block
+    # the isolated quote-asset wallet.  The active base asset below still uses
+    # the strict ENTRY_UNKNOWN guard when its entry cannot be proven.
     if external_holding is not None and pos is None:
         previous_external_key = syncState.get("external_holding_key")
         _clear_entry_unknown(syncState)
         external_key = f"{external_holding['asset']}:{external_holding['qty']}:{external_holding['locked']}"
         is_new_external_holding = previous_external_key != external_key
         syncState.update({
-            "status": "EXTERNAL_HOLDING",
-            "reason": "external_symbol_found",
             "external_asset": external_holding["asset"],
             "external_symbol": external_holding["symbol"],
             "external_holding_key": external_key,
         })
-        _write_runtime_snapshot(now, symbol, acc, balances, None, "external_symbol_found", holdings)
+        _write_runtime_snapshot(now, symbol, acc, balances, None, "external_holdings_observed", holdings)
         return None, syncState, {
-            "changed": True,
             "external_holding_new": is_new_external_holding,
-            "status": "EXTERNAL_HOLDING",
+            "external_holdings_observed": True,
             "usdc": free_usdc,
-            "reason": "external_symbol_found",
+            "reason": "wallet_empty",
             "external_symbol": external_holding["symbol"],
             "external_asset": external_holding["asset"],
             "wallet_qty": external_holding["qty"],

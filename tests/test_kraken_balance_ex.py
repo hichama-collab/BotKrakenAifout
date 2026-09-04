@@ -36,7 +36,7 @@ def test_balance_ex_maps_available_and_trade_hold():
     assert balances["BTC"]["locked"] == "0.001"
 
 
-def test_external_holding_without_usdc_pair_is_visible_and_blocks_entry(tmp_path, monkeypatch):
+def test_external_holding_without_usdc_pair_is_visible_without_blocking_usdc_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("BOT_RUNTIME_DIR", str(tmp_path))
     bx = FakeKraken([
         {"asset": "IDOS", "free": "1.7", "locked": "15928.3", "total": "15930"},
@@ -54,8 +54,9 @@ def test_external_holding_without_usdc_pair_is_visible_and_blocks_entry(tmp_path
     )
 
     assert pos is None
-    assert state["status"] == "EXTERNAL_HOLDING"
-    assert info["reason"] == "external_symbol_found"
+    assert state.get("status") is None
+    assert info["reason"] == "wallet_empty"
+    assert info["external_holdings_observed"] is True
     assert info["external_symbol"] == "IDOSUSDC"
     assert info["valuation_status"] == "UNVALUED_NO_DIRECT_QUOTE"
 
