@@ -329,8 +329,8 @@ def print_report(report: dict) -> None:
     print(f"selector_no_eligible: {report['selector_no_eligible']}")
     print(f"api_order_errors: {len(report['api_order_errors'])}")
     print(f"conclusions: {', '.join(report['conclusions']) or 'NONE'}")
-    print("TUNING_PROPOSE_NON_APPLIQUE:")
-    print("  No threshold changed. HOLD_EDGE and NEAR_PEAK require the new trace on a funded run before any tuning proposal.")
+    print("AUDIT_MODE:")
+    print("  Read-only: this audit never changes thresholds or submits orders.")
 
 
 def main() -> int:
