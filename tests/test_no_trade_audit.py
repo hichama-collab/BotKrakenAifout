@@ -27,6 +27,8 @@ def test_no_trade_audit_reports_balance_and_p_gate(tmp_path):
         "symbol=XRPUSDC mom_ok=1 p1=1.47035 p2=1.47039 p3=1.47027 p4=1.47004 "
         "p_rising=0 tape_progress_pct=0.0211 fee_edge_pct=0.4010 spread_pct=0.0340 "
         "final_hold_reason=P_RISING_FALSE\n"
+        "[2026-08-23 00:00:01+0000] ENTRY_GATE_PASS "
+        "symbol=XRPUSDC entry_stage=ORDER_ATTEMPT order_notional=20\n"
         "[2026-08-23 00:00:00+0000] DECIDE_HOLD reason=HOLD_NO_ENTRY_SIGNAL\n",
         encoding="utf-8",
     )
@@ -49,6 +51,7 @@ def test_no_trade_audit_reports_balance_and_p_gate(tmp_path):
     assert report["csv_rows"] == 1
     assert report["events"] == {"DECIDE_HOLD": 1}
     assert report["order_events"] == {}
+    assert report["entry_gate_passes"] == 1
     assert report["gate_analysis"]["mom_ok_p_rising_false"] == 1
     assert report["gate_analysis"]["tape_to_fee_ratio"]["mean"] == round(0.0211 / 0.4010, 6)
     assert "NO_ORDER_ATTEMPT" in report["conclusions"]

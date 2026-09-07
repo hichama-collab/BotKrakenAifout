@@ -131,6 +131,7 @@ def audit_paths(logs_dir: Path, runtime_dir: Path) -> dict:
     csv_rows: list[dict] = []
     csv_trace_records: list[dict] = []
     log_records: list[dict] = []
+    entry_gate_passes: list[dict] = []
     api_order_errors: list[str] = []
     selector_no_eligible = 0
 
@@ -165,6 +166,10 @@ def audit_paths(logs_dir: Path, runtime_dir: Path) -> dict:
                     payload = _parse_kv(line.split("ENTRY_GATE_TRACE ", 1)[1])
                     payload["_kind"] = "trace"
                     log_records.append(payload)
+                elif "ENTRY_GATE_PASS " in line:
+                    payload = _parse_kv(line.split("ENTRY_GATE_PASS ", 1)[1])
+                    payload["_kind"] = "gate_pass"
+                    entry_gate_passes.append(payload)
                 elif "DECIDE_HOLD reason=" in line:
                     payload = _parse_kv(line)
                     reason_match = re.search(r"DECIDE_HOLD reason=([^\s]+)", line)
@@ -202,8 +207,10 @@ def audit_paths(logs_dir: Path, runtime_dir: Path) -> dict:
     near_peak_mom_ok = 0
     near_peak_spread_ok = 0
     near_peak_candidate_otherwise = 0
+    entry_stages = Counter()
 
     for trace in traces:
+        entry_stages[str(trace.get("entry_stage") or "UNSPECIFIED")] += 1
         p_rising = _p_rising(trace)
         mom_ok = _bool(trace.get("mom_ok"))
         final_reason = _reason_type(trace.get("final_hold_reason") or trace.get("reason"))
@@ -263,6 +270,7 @@ def audit_paths(logs_dir: Path, runtime_dir: Path) -> dict:
         "events_by_symbol": {symbol: dict(values.most_common()) for symbol, values in sorted(event_by_symbol.items())},
         "reasons_by_symbol": {symbol: dict(values.most_common()) for symbol, values in sorted(reason_by_symbol.items())},
         "order_events": order_events,
+        "entry_gate_passes": len(entry_gate_passes),
         "runtime": runtime,
         "top_blockages": reasons.most_common(20),
         "gate_analysis": {
@@ -279,6 +287,7 @@ def audit_paths(logs_dir: Path, runtime_dir: Path) -> dict:
                 "spread_ok": near_peak_spread_ok,
                 "candidate_otherwise": near_peak_candidate_otherwise,
             },
+            "entry_stages": dict(entry_stages.most_common()),
         },
         "selector_no_eligible": selector_no_eligible,
         "api_order_errors": api_order_errors[:20],
@@ -313,6 +322,7 @@ def print_report(report: dict) -> None:
     print(f"  selector_state: {runtime['selector_state']}")
     print(f"order_attempts: {sum(report['order_events'].values())}")
     _print_counter("order_events", report["order_events"])
+    print(f"entry_gate_passes: {report['entry_gate_passes']}")
     print("gate_analysis:")
     for key, value in report["gate_analysis"].items():
         print(f"  {key}: {value}")

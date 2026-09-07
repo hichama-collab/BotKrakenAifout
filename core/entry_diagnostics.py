@@ -10,6 +10,7 @@ TRACE_FIELD_ORDER = (
     "symbol",
     "profile",
     "strategy",
+    "entry_stage",
     "has_new_tick",
     "pending_switch",
     "p_entry_enabled",
@@ -23,6 +24,8 @@ TRACE_FIELD_ORDER = (
     "mom_ok",
     "mom_pct",
     "mom_min_pct",
+    "mom_range_pct",
+    "max_mom_pct",
     "range_enabled",
     "range_ok",
     "burst_enabled",
@@ -33,12 +36,21 @@ TRACE_FIELD_ORDER = (
     "entry_min_strict_ups",
     "tape_progress_pct",
     "entry_min_tape_progress_pct",
+    "required_tape_progress_pct",
+    "min_range_entry_pct",
+    "min_range_vs_spread",
+    "required_range_pct",
     "spread_pct",
     "max_spread_pct",
     "planned_tp_pct",
     "planned_cost_pct",
     "planned_net_pct",
     "plan_viable",
+    "signal_snapshot_ready",
+    "rsi",
+    "ema1_ok",
+    "ema5_ok",
+    "vol_ok",
     "near_peak",
     "pic_filter_enabled",
     "blocked_symbol",
@@ -49,6 +61,9 @@ TRACE_FIELD_ORDER = (
     "qty_estimated",
     "sizing_ok",
     "can_buy",
+    "order_limit_price",
+    "order_qty",
+    "order_notional",
     "final_hold_reason",
 )
 
@@ -86,6 +101,41 @@ def p_tape_snapshot(p1: Any, p2: Any, p3: Any, p4: Any) -> dict:
         ),
         "strict_up_moves": strict_up_moves,
         "tape_progress_pct": tape_progress_pct,
+    }
+
+
+def entry_gate_requirements(*, spread: Any, cfg: Any) -> dict:
+    """Expose the existing P-entry thresholds without changing their policy."""
+    spread_value = max(0.0, _float_or_none(spread) or 0.0)
+    max_mom_pct = float(getattr(cfg, "momMaxPct", 1.0) or 1.0)
+    min_range_entry_pct = float(getattr(cfg, "minRangeEntryPct", 0.0) or 0.0)
+    min_range_vs_spread = float(getattr(cfg, "minRangeVsSpread", 0.0) or 0.0)
+    min_tape_progress_pct = float(getattr(cfg, "entryMinTapeProgressPct", 0.0) or 0.0)
+    min_tape_progress_vs_spread = float(
+        getattr(cfg, "entryMinTapeProgressVsSpread", 0.0) or 0.0
+    )
+
+    return {
+        "max_mom_pct": max_mom_pct,
+        "min_range_entry_pct": min_range_entry_pct,
+        "min_range_vs_spread": min_range_vs_spread,
+        "required_range_pct": max(
+            min_range_entry_pct,
+            spread_value * min_range_vs_spread,
+        ),
+        "min_tape_progress_pct": min_tape_progress_pct,
+        "min_tape_progress_vs_spread": min_tape_progress_vs_spread,
+        "required_tape_progress_pct": max(
+            min_tape_progress_pct,
+            spread_value * min_tape_progress_vs_spread,
+        ),
+        "entry_min_strict_ups": max(
+            1,
+            int(getattr(cfg, "entryMinStrictUps", 1) or 1),
+        ),
+        "hard_min_up_ratio": float(
+            getattr(cfg, "entryHardMinUpRatio", 0.0) or 0.0
+        ),
     }
 
 

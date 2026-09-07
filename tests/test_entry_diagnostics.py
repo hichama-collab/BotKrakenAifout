@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from core.entry_diagnostics import p_tape_snapshot, quote_sizing_snapshot
+from core.entry_diagnostics import entry_gate_requirements, format_entry_gate_trace, p_tape_snapshot, quote_sizing_snapshot
 from main import compute_entry_plan_viability, momentum_ok
 
 
@@ -28,6 +28,32 @@ def test_p_tape_snapshot_matches_existing_non_decreasing_gate():
     assert blocked["p_rising"] is False
     assert accepted["p_rising"] is True
     assert accepted["strict_up_moves"] == 3
+
+
+def test_entry_gate_requirements_make_default_range_visible():
+    requirements = entry_gate_requirements(
+        spread=0.0004930966469427727,
+        cfg=SimpleNamespace(
+            momMaxPct=1.0,
+            minRangeEntryPct=0.0035,
+            minRangeVsSpread=4.0,
+            entryMinTapeProgressPct=0.00025,
+            entryMinTapeProgressVsSpread=1.0,
+            entryMinStrictUps=2,
+            entryHardMinUpRatio=0.55,
+        ),
+    )
+
+    assert requirements["required_range_pct"] == 0.0035
+    assert requirements["required_tape_progress_pct"] == 0.0004930966469427727
+    trace = format_entry_gate_trace({
+        "entry_stage": "RANGE",
+        "required_range_pct": requirements["required_range_pct"] * 100.0,
+        "rsi": 58.2,
+    })
+    assert "entry_stage=RANGE" in trace
+    assert "required_range_pct=0.35" in trace
+    assert "rsi=58.2" in trace
 
 
 def test_adjacent_tick_p_path_can_reach_a_profitable_trade_plan():

@@ -11,7 +11,12 @@ from typing import Optional
 from execution.fee_model import FeeModel
 from state.persisted import PersistedPosition, save_position, load_position, clear_position, reconcile_with_wallet
 from risk.circuit_breaker import CircuitBreaker
-from core.entry_diagnostics import format_entry_gate_trace, p_tape_snapshot, quote_sizing_snapshot
+from core.entry_diagnostics import (
+    entry_gate_requirements,
+    format_entry_gate_trace,
+    p_tape_snapshot,
+    quote_sizing_snapshot,
+)
 
 
 def momentum_ok(
@@ -1242,6 +1247,9 @@ def main():
             return
         lastHoldCsv = now
         trace = dict(entryGateContext)
+        for key in ("rsi", "ema1_ok", "ema5_ok", "vol_ok"):
+            if key in signal:
+                trace[key] = signal[key]
         trace["hold_reason"] = str(reason)
         trace["final_hold_reason"] = final_hold_reason or trace.get("final_hold_reason") or str(reason)
         lastHoldReason = str(reason)
@@ -1302,6 +1310,24 @@ def main():
                 f"range={momRangePct*100:.4f}% up={upRatio*100:.2f}% "
                 f"mid={mid:.8f} P1={p1} P2={p2} P3={p3} P4={p4}{detail_suffix}"
             )
+        except Exception:
+            pass
+
+    def log_entry_gate_pass(*, buy_price, qty, notional):
+        """Record a secret-free snapshot immediately before the order REST call."""
+        nonlocal lastEntryGateTrace
+        trace = dict(entryGateContext)
+        trace.update({
+            "entry_stage": "ORDER_ATTEMPT",
+            "order_limit_price": float(buy_price),
+            "order_qty": float(qty),
+            "order_notional": float(notional),
+        })
+        lastEntryGateTrace = trace
+        try:
+            line = f"ENTRY_GATE_PASS {format_entry_gate_trace(trace)}"
+            logTrade(line)
+            print(line)
         except Exception:
             pass
 
@@ -1697,6 +1723,7 @@ def main():
                     logErr("RANGE_ANALYSIS_FAIL", e)
 
             pTrace = p_tape_snapshot(P1, P2, P3, P4)
+            entryRequirements = entry_gate_requirements(spread=float(spread), cfg=cfg)
             trace_plan = compute_entry_plan_viability(
                 float(spread),
                 cfg,
@@ -1707,6 +1734,7 @@ def main():
                 "symbol": symbol,
                 "profile": profile.name,
                 "strategy": getattr(cfg, "strategyName", ""),
+                "entry_stage": "WAIT_ENTRY_SIGNAL",
                 "has_new_tick": bool(has_new_tick),
                 "pending_switch": bool(pendingSwitchSymbol),
                 "p_entry_enabled": bool(getattr(cfg, "pEntryEnabled", True)),
@@ -1720,6 +1748,8 @@ def main():
                 "mom_ok": bool(momOk),
                 "mom_pct": float(momPct) * 100.0,
                 "mom_min_pct": float(momMinPct) * 100.0,
+                "mom_range_pct": float(momRangePct) * 100.0,
+                "max_mom_pct": entryRequirements["max_mom_pct"] * 100.0,
                 "range_enabled": bool(range_enabled),
                 "range_ok": bool(range_signal) if range_enabled else True,
                 "burst_enabled": bool(getattr(cfg, "burstEntryEnabled", False)),
@@ -1730,12 +1760,17 @@ def main():
                 "entry_min_strict_ups": max(1, int(getattr(cfg, "entryMinStrictUps", 1) or 1)),
                 "tape_progress_pct": pTrace["tape_progress_pct"],
                 "entry_min_tape_progress_pct": float(getattr(cfg, "entryMinTapeProgressPct", 0.0) or 0.0) * 100.0,
+                "required_tape_progress_pct": entryRequirements["required_tape_progress_pct"] * 100.0,
+                "min_range_entry_pct": entryRequirements["min_range_entry_pct"] * 100.0,
+                "min_range_vs_spread": entryRequirements["min_range_vs_spread"],
+                "required_range_pct": entryRequirements["required_range_pct"] * 100.0,
                 "spread_pct": float(spread) * 100.0,
                 "max_spread_pct": float(spreadLimit) * 100.0,
                 "planned_tp_pct": trace_plan["planned_tp_pct"] * 100.0,
                 "planned_cost_pct": trace_plan["planned_cost_pct"] * 100.0,
                 "planned_net_pct": trace_plan["planned_net_pct"] * 100.0,
                 "plan_viable": trace_plan["plan_viable"],
+                "signal_snapshot_ready": False,
                 "near_peak": False,
                 "pic_filter_enabled": bool(getattr(cfg, "picFilter_enabled", False)),
                 "blocked_symbol": symbol in blockedSymbols,
@@ -1930,6 +1965,7 @@ def main():
             if buySignal:
                 burstOverride = entryMode == "BURST"
                 rangeOverride = entryMode == "RANGE_V1"
+                entryGateContext["entry_stage"] = "PIC_FILTER"
 
                 # Pic filter — block entry if bid is too close to recent peak
                 if bool(getattr(cfg, "picFilter_enabled", False)):
@@ -1950,6 +1986,7 @@ def main():
                         )
                         continue
                 if symbol in blockedSymbols:
+                    entryGateContext["entry_stage"] = "BLOCKED_SYMBOL"
                     maybe_hold(
                         now,
                         'HOLD_BLOCKED_SYMBOL',
@@ -1968,21 +2005,14 @@ def main():
                     time.sleep(cfg.idleSleep)
                     continue
 
-                max_mom_pct = float(getattr(cfg, "momMaxPct", 1.0) or 1.0)
-                min_range_entry_pct = float(getattr(cfg, "minRangeEntryPct", 0.0) or 0.0)
-                min_range_vs_spread = float(getattr(cfg, "minRangeVsSpread", 0.0) or 0.0)
-                required_range_pct = max(min_range_entry_pct, float(spread) * min_range_vs_spread)
+                max_mom_pct = entryRequirements["max_mom_pct"]
+                required_range_pct = entryRequirements["required_range_pct"]
                 has_p_window = all(v is not None for v in (P1, P2, P3, P4))
                 strict_up_moves = (int(P1 > P2) + int(P2 > P3) + int(P3 > P4)) if has_p_window else 0
-                entry_min_strict_ups = max(1, int(getattr(cfg, "entryMinStrictUps", 1) or 1))
-                hard_min_up_ratio = float(getattr(cfg, "entryHardMinUpRatio", 0.0) or 0.0)
+                entry_min_strict_ups = entryRequirements["entry_min_strict_ups"]
+                hard_min_up_ratio = entryRequirements["hard_min_up_ratio"]
                 tape_progress_pct = ((float(P1) - float(P4)) / float(P4)) if (has_p_window and float(P4) > 0) else 0.0
-                min_tape_progress_pct = float(getattr(cfg, "entryMinTapeProgressPct", 0.0) or 0.0)
-                min_tape_progress_vs_spread = float(getattr(cfg, "entryMinTapeProgressVsSpread", 0.0) or 0.0)
-                required_tape_progress_pct = max(
-                    min_tape_progress_pct,
-                    float(spread) * min_tape_progress_vs_spread,
-                )
+                required_tape_progress_pct = entryRequirements["required_tape_progress_pct"]
 
                 if burstOverride and bool(getattr(cfg, "burstRequireTape", False)):
                     if not has_p_window:
@@ -2202,6 +2232,7 @@ def main():
                     logTrade(range_msg)
 
                 if (not burstOverride and not rangeOverride) and (not momOk):
+                    entryGateContext["entry_stage"] = "MOMENTUM"
                     maybe_hold(
                         now,
                         'HOLD_MOM',
@@ -2221,6 +2252,7 @@ def main():
                     continue
 
                 if (not burstOverride and not rangeOverride) and strict_up_moves < entry_min_strict_ups:
+                    entryGateContext["entry_stage"] = "TAPE_STRICT_UPS"
                     maybe_hold(
                         now,
                         'HOLD_TAPE',
@@ -2241,6 +2273,7 @@ def main():
                     continue
 
                 if (not burstOverride and not rangeOverride) and required_tape_progress_pct > 0 and tape_progress_pct < required_tape_progress_pct:
+                    entryGateContext["entry_stage"] = "TAPE_PROGRESS"
                     maybe_hold(
                         now,
                         'HOLD_TAPE',
@@ -2264,6 +2297,7 @@ def main():
                     continue
 
                 if (not burstOverride and not rangeOverride) and hard_min_up_ratio > 0 and upRatio < hard_min_up_ratio:
+                    entryGateContext["entry_stage"] = "UP_RATIO"
                     maybe_hold(
                         now,
                         'HOLD_UPRATIO',
@@ -2466,6 +2500,7 @@ def main():
                     continue
 
                 if (not burstOverride and not rangeOverride) and required_range_pct > 0 and momRangePct < required_range_pct:
+                    entryGateContext["entry_stage"] = "RANGE"
                     maybe_hold(
                         now,
                         'HOLD_RANGE',
@@ -2486,6 +2521,7 @@ def main():
                     continue
 
                 if (not burstOverride and not rangeOverride) and spread > spreadLimit:
+                    entryGateContext["entry_stage"] = "SPREAD"
                     maybe_hold(
                         now,
                         'HOLD_SPREAD',
@@ -2506,6 +2542,7 @@ def main():
                     continue
 
                 if not burstOverride and not rangeOverride:
+                    entryGateContext["entry_stage"] = "SIGNAL_SNAPSHOT"
                     s1, s5, market_ctx = load_signal_snapshot(now)
                     if s1 is None or s5 is None or market_ctx is None:
                         maybe_hold(
@@ -2536,6 +2573,10 @@ def main():
                         "ema5_ok": ema5_ok,
                         "vol_ok": vol_ok,
                     }
+                    entryGateContext.update({
+                        "signal_snapshot_ready": True,
+                        **signal_state,
+                    })
 
                     strong_trend_resume = (
                         ema1_ok
@@ -2546,6 +2587,7 @@ def main():
                     if bool(getattr(cfg, "entryEmaFilter_enabled", True)) and (
                         not ema1_ok or (not ema5_ok and not strong_trend_resume)
                     ):
+                        entryGateContext["entry_stage"] = "EMA"
                         maybe_hold(
                             now,
                             'HOLD_EMA',
@@ -2575,6 +2617,7 @@ def main():
                         float(getattr(cfg, "rsiBuyMax", 100.0) or 100.0),
                     )
                     if not (rsi_min <= rsi_now <= rsi_max):
+                        entryGateContext["entry_stage"] = "RSI"
                         maybe_hold(
                             now,
                             'HOLD_RSI',
@@ -2596,6 +2639,7 @@ def main():
                         continue
 
                     if not vol_ok:
+                        entryGateContext["entry_stage"] = "VOLUME"
                         maybe_hold(
                             now,
                             'HOLD_VOL',
@@ -2630,6 +2674,7 @@ def main():
                     })
 
                 if usdc is None:
+                    entryGateContext["entry_stage"] = "WALLET"
                     entryGateContext["sizing_ok"] = False
                     maybe_hold(
                         now,
@@ -2650,6 +2695,7 @@ def main():
                     continue
 
                 if usdc < float(minNotional):
+                    entryGateContext["entry_stage"] = "MIN_NOTIONAL"
                     entryGateContext["sizing_ok"] = False
                     entryGateContext["can_buy"] = False
                     entryGateContext["blocking_reason"] = (
@@ -2683,6 +2729,7 @@ def main():
                 spend = min(cap, spendable_usdc)
 
                 if spend < float(minNotional):
+                    entryGateContext["entry_stage"] = "MIN_NOTIONAL"
                     entryGateContext["sizing_ok"] = False
                     entryGateContext["can_buy"] = False
                     entryGateContext["sizing_cap"] = spend
@@ -2750,6 +2797,7 @@ def main():
                     entry_edge["signal_edge_pct"] >= entry_edge["required_edge_pct"]
                 )
                 if not entry_plan_viable:
+                    entryGateContext["entry_stage"] = "ECONOMIC_PLAN"
                     if entryMode == "P":
                         entry_detail = (
                             f"mode={entryMode} planned_tp={entry_edge['planned_tp_pct']*100:.4f}% "
@@ -2804,6 +2852,7 @@ def main():
                         notional = required_quote
 
                 if qty <= 0 or notional < float(minNotional):
+                    entryGateContext["entry_stage"] = "SIZING"
                     missing_quote = max(0.0, required_quote - max_quote_budget) if required_quote > 0 else 0.0
                     entryGateContext["qty_estimated"] = qty
                     entryGateContext["sizing_ok"] = False
@@ -2836,6 +2885,7 @@ def main():
                 entryGateContext["qty_estimated"] = qty
                 entryGateContext["sizing_ok"] = True
                 entryGateContext["can_buy"] = True
+                log_entry_gate_pass(buy_price=buyPx, qty=qty, notional=notional)
 
                 try:
                     order = placeLimit(
